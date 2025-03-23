@@ -1,0 +1,260 @@
+import hashlib, time, json, datetime, random
+from typing import List, Dict, Optional
+
+class L2Block:
+    def __init__(self, transactions: List[Dict], previous_hash: str, pool_hash: str):
+        self.timestamp = time.time()
+        self.transactions = transactions
+        self.previous_hash = previous_hash
+        self.pool_hash = pool_hash
+        self.hash = hashlib.sha256(json.dumps({
+            'timestamp': self.timestamp, 
+            'transactions': self.transactions, 
+            'previous_hash': self.previous_hash,
+            'pool_hash': self.pool_hash
+        }, sort_keys=True).encode()).hexdigest()
+
+class Node:
+    def __init__(self, node_id: str, latency: float = 1.0):
+        self.node_id = node_id
+        self.latency = latency
+        self.hash_contribution = 0
+        self.vote_for_limit_increase = False
+
+class L2BitcoinChain:
+    def __init__(self, node_id: str):
+        self.BASE_USD_LIMIT = 1500  # Initial wallet limit in 2024
+        self.FEE_PERCENTAGE = 0.03  # 3% of tx amount
+        self.BASE_YEAR = 2024
+        self.HALVING_INTERVAL = 4
+        self.ANNUAL_LIMIT_INCREASE = 0.15  # 15% per year
+        self.BASE_HASH_CONTRIBUTION = 11250000  # 75% of 15M H/s in 2024
+        self.BASE_STORAGE_BYTES = 1073741824  # 1 GB in 2024
+        self.MOORE_RATE = 0.41  # 41% annual increase, applied at halving
+        self.PRUNE_THRESHOLD = datetime.timedelta(days=365)
+        self.current_btc_price = 60000
+        self.chain: List[L2Block] = []
+        self.pending_transactions: List[Dict] = []
+        self.balances: Dict[str, float] = {}
+        self.secondary_addresses: Dict[str, str] = {}
+        self.nodes: Dict[str, Node] = {node_id: Node(node_id)}
+        self.current_node = node_id
+        self.first_node = node_id
+        self.pool_hash = "0" * 64
+        self.total_fees: float = 0
+        self.last_halving_period = -1
+        self.chain.append(L2Block([], "0" * 64, self.pool_hash))
+        self.update_limits()
+
+    def get_current_year(self) -> int:
+        return datetime.datetime.now().year
+
+    def get_halving_periods_elapsed(self) -> int:
+        years_elapsed = self.get_current_year() - self.BASE_YEAR
+        return years_elapsed // self.HALVING_INTERVAL
+
+    def calculate_min_hash_contribution(self) -> int:
+        periods_elapsed = self.get_halving_periods_elapsed()
+        return int(self.BASE_HASH_CONTRIBUTION * (1 + self.MOORE_RATE) ** (periods_elapsed * self.HALVING_INTERVAL))
+
+    def calculate_storage_requirement(self) -> int:
+        periods_elapsed = self.get_halving_periods_elapsed()
+        return int(self.BASE_STORAGE_BYTES * (1 + self.MOORE_RATE) ** (periods_elapsed * self.HALVING_INTERVAL))
+
+    def calculate_wallet_limit_increase(self) -> float:
+        """Calculate compounded 15% annual increase since last halving"""
+        periods_elapsed = self.get_halving_periods_elapsed()
+        years_since_base = periods_elapsed * self.HALVING_INTERVAL
+        return self.BASE_USD_LIMIT * (1 + self.ANNUAL_LIMIT_INCREASE) ** years_since_base
+
+    def vote_on_limit_increase(self):
+        current_period = self.get_halving_periods_elapsed()
+        if current_period > self.last_halving_period:
+            votes_for = sum(1 for node in self.nodes.values() if node.vote_for_limit_increase)
+            total_nodes = len(self.nodes)
+            if votes_for > total_nodes / 2:  # Majority vote
+                self.BASE_USD_LIMIT = self.calculate_wallet_limit_increase()
+            self.last_halving_period = current_period
+
+    def set_node_vote(self, node_id: str, vote: bool):
+        if node_id in self.nodes:
+            self.nodes[node_id].vote_for_limit_increase = vote
+
+    def update_limits(self): 
+        self.vote_on_limit_increase()
+        self.SOFT_LIMIT = self.BASE_USD_LIMIT / self.current_btc_price
+        self.MIN_HASH_CONTRIBUTION = self.calculate_min_hash_contribution()
+        self.STORAGE_REQUIREMENT = self.calculate_storage_requirement()
+
+    def simulate_price_update(self): 
+        self.current_btc_price = max(10000, min(200000, self.current_btc_price * (1 + random.uniform(-0.1, 0.1))))
+        self.update_limits()
+
+    def add_node(self, node_id: str, latency: float):
+        self.nodes[node_id] = Node(node_id, latency)
+
+    def set_secondary_address(self, primary: str, secondary: str): 
+        self.secondary_addresses[primary] = secondary
+
+    def create_block(self, transactions: List[Dict]) -> L2Block: 
+        block = L2Block(transactions, self.chain[-1].hash if self.chain else "0" * 64, self.pool_hash)
+        self.chain.append(block)
+        self.prune_chain()
+        return block
+
+    def prune_chain(self):
+        current_time = datetime.datetime.now()
+        new_chain = []
+        for block in self.chain:
+            block_time = datetime.datetime.fromtimestamp(block.timestamp)
+            if current_time - block_time <= self.PRUNE_THRESHOLD:
+                new_chain.append(block)
+        self.chain = new_chain if new_chain else [self.chain[0]]
+
+    def select_fastest_node(self) -> str:
+        return min(self.nodes.items(), key=lambda x: x[1].latency)[0]
+
+    def contribute_to_pool(self, node_id: str):
+        node = self.nodes[node_id]
+        simulation_scale = 1000
+        start_time = time.time()
+        for i in range(min(simulation_scale, self.MIN_HASH_CONTRIBUTION // 1000)):
+            self.pool_hash = hashlib.sha256(f"{self.pool_hash}{node_id}{i}".encode()).hexdigest()
+        elapsed = time.time() - start_time
+        target_time = self.MIN_HASH_CONTRIBUTION / 11250000
+        if elapsed < target_time: 
+            time.sleep(target_time - elapsed)
+        node.hash_contribution += self.MIN_HASH_CONTRIBUTION
+
+    def validate_and_split_transaction(self, sender: str, amount: float, receiver: str, tx_id: str, 
+                                     confirming_node: str) -> List[Dict]:
+        self.simulate_price_update()
+        if confirming_node not in self.nodes: 
+            return []
+        
+        is_first_node = confirming_node == self.first_node
+        usd_amount = amount * self.current_btc_price
+        fee_usd = usd_amount * self.FEE_PERCENTAGE
+        fee_btc = fee_usd / self.current_btc_price if is_first_node else 0
+        
+        if self.balances.get(sender, 0) < amount + fee_btc: 
+            return []
+        
+        receiver_balance = self.balances.get(receiver, 0)
+        transactions = []
+        primary_amount = min(amount, max(0, self.SOFT_LIMIT - receiver_balance))
+        
+        if primary_amount > 0:
+            tx = {
+                'sender': sender, 
+                'receiver': receiver, 
+                'amount': primary_amount, 
+                'timestamp': time.time(), 
+                'tx_id': tx_id, 
+                'node_id': confirming_node
+            }
+            if is_first_node:
+                tx['node_fee'] = fee_btc
+                self.total_fees += fee_btc
+            self.contribute_to_pool(confirming_node)
+            transactions.append(tx)
+        
+        excess_amount = amount - primary_amount
+        if excess_amount > 0 and receiver in self.secondary_addresses:
+            tx = {
+                'sender': sender, 
+                'receiver': self.secondary_addresses[receiver], 
+                'amount': excess_amount, 
+                'timestamp': time.time(), 
+                'tx_id': f"{tx_id}_excess",
+                'node_id': confirming_node, 
+                'node_fee': 0, 
+                'note': 'excess redirect'
+            }
+            self.contribute_to_pool(confirming_node)
+            transactions.append(tx)
+        return transactions
+
+    def add_transaction(self, sender: str, amount: float, receiver: str, 
+                       preferred_node: Optional[str] = None, use_fastest: bool = False) -> bool:
+        tx_id = hashlib.sha256(f"{sender}{receiver}{amount}{time.time()}".encode()).hexdigest()[:8]
+        node_id = preferred_node if preferred_node else (self.select_fastest_node() if use_fastest else self.current_node)
+        
+        transactions = self.validate_and_split_transaction(sender, amount, receiver, tx_id, node_id)
+        if not transactions: 
+            return False
+        
+        for node_id in self.nodes:
+            if node_id != transactions[0]['node_id']:
+                self.contribute_to_pool(node_id)
+                time.sleep(self.nodes[node_id].latency)
+        
+        for tx in transactions:
+            self.pending_transactions.append(tx)
+            fee = tx.get('node_fee', 0)
+            self.balances[tx['sender']] = self.balances.get(tx['sender'], 0) - tx['amount'] - fee
+            self.balances[tx['receiver']] = self.balances.get(tx['receiver'], 0) + tx['amount']
+        
+        if self.should_batch_to_bitcoin(): 
+            self.batch_to_bitcoin()
+        return True
+
+    def should_batch_to_bitcoin(self) -> bool: 
+        return not self.chain or (datetime.datetime.now() - datetime.datetime.fromtimestamp(self.chain[-1].timestamp)) >= datetime.timedelta(days=30)
+
+    def batch_to_bitcoin(self): 
+        if self.pending_transactions: 
+            self.create_block(self.pending_transactions.copy())
+            print(f"Submitting to Bitcoin network: {json.dumps({'type': 'L2_batch', 'block_hash': self.chain[-1].hash, 'pool_hash': self.pool_hash, 'timestamp': time.time()})}")
+            self.pending_transactions = []
+
+    def get_balance(self, address: str) -> float: 
+        return self.balances.get(address, 0)
+
+    def get_node_contribution(self, node_id: str) -> int: 
+        return self.nodes.get(node_id, Node("")).hash_contribution
+
+    def get_total_fees(self) -> float: 
+        return self.total_fees
+
+    def get_current_limits(self) -> Dict[str, float]: 
+        return {
+            'btc_price': self.current_btc_price, 
+            'soft_limit': self.SOFT_LIMIT, 
+            'fee_percentage': self.FEE_PERCENTAGE,
+            'min_hash_contribution': self.MIN_HASH_CONTRIBUTION,
+            'storage_requirement_bytes': self.STORAGE_REQUIREMENT,
+            'base_usd_limit': self.BASE_USD_LIMIT
+        }
+
+    def get_chain_size(self) -> int: 
+        return len(self.chain)
+
+if __name__ == "__main__":
+    l2 = L2BitcoinChain("Node1")
+    l2.add_node("Node2", 0.5)
+    l2.add_node("Node3", 2.0)
+    l2.set_secondary_address("Bob", "Bob_Secondary")
+    l2.balances["Alice"] = 0.05
+    
+    l2.set_node_vote("Node1", True)
+    l2.set_node_vote("Node2", True)
+    l2.set_node_vote("Node3", False)
+    
+    print("Initial state:", l2.get_current_limits())
+    
+    print(f"\nTx1 (0.01 BTC): {l2.add_transaction('Alice', 0.01, 'Bob', 'Node2')}")
+    print(f"Tx2 (0.03 BTC): {l2.add_transaction('Alice', 0.03, 'Bob', use_fastest=True)}")
+    
+    print(f"\nAlice: {l2.get_balance('Alice'):.8f}")
+    print(f"Bob: {l2.get_balance('Bob'):.8f}")
+    print(f"Bob_Secondary: {l2.get_balance('Bob_Secondary'):.8f}")
+    print(f"Total fees (Node1): {l2.get_total_fees():.8f}")
+    print(f"Node1 contrib: {l2.get_node_contribution('Node1')}")
+    print(f"Node2 contrib: {l2.get_node_contribution('Node2')}")
+    print(f"Node3 contrib: {l2.get_node_contribution('Node3')}")
+    print(f"Chain size: {l2.get_chain_size()}")
+    
+    print("\nPending txs:", json.dumps(l2.pending_transactions, indent=2))
+    print("\nBatching..."); l2.batch_to_bitcoin()
+    print(f"Chain length: {l2.get_chain_size()}")
