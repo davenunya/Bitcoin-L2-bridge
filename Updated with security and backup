@@ -1,0 +1,363 @@
+import hashlib, time, json, datetime, random
+from typing import List, Dict, Optional
+from ecdsa import SigningKey, SECP256k1
+from hashlib import sha256
+from mnemonic import Mnemonic
+from bip32utils import BIP32Key, BIP32_HARDEN  # For BIP-32 HD wallets
+
+class L2Block:
+    def __init__(self, transactions: List[Dict], previous_hash: str, pool_hash: str, difficulty: int = 4):
+        self.timestamp = time.time()
+        self.transactions = transactions
+        self.previous_hash = previous_hash
+        self.pool_hash = pool_hash
+        self.merkle_root = self.calculate_merkle_root()
+        self.nonce = 0
+        self.difficulty = difficulty
+        self.hash = self.mine_block()
+
+    def calculate_merkle_root(self) -> str:
+        if not self.transactions:
+            return "0" * 64
+        tx_hashes = [sha256(json.dumps(tx, sort_keys=True).encode()).hexdigest() for tx in self.transactions]
+        while len(tx_hashes) > 1:
+            temp_hashes = []
+            for i in range(0, len(tx_hashes), 2):
+                pair = tx_hashes[i:i+2]
+                if len(pair) == 1:
+                    pair.append(pair[0])
+                combined = pair[0] + pair[1]
+                temp_hashes.append(sha256(combined.encode()).hexdigest())
+            tx_hashes = temp_hashes
+        return tx_hashes[0]
+
+    def mine_block(self) -> str:
+        while True:
+            block_data = json.dumps({
+                'timestamp': self.timestamp,
+                'merkle_root': self.merkle_root,
+                'previous_hash': self.previous_hash,
+                'pool_hash': self.pool_hash,
+                'nonce': self.nonce
+            }, sort_keys=True).encode()
+            block_hash = sha256(block_data).hexdigest()
+            if block_hash.startswith("0" * self.difficulty):
+                return block_hash
+            self.nonce += 1
+
+class Node:
+    def __init__(self, node_id: str, latency: float = 1.0):
+        self.node_id = node_id
+        self.latency = latency
+        self.hash_contribution = 0
+        self.vote_for_limit_increase = False
+        self.private_key, self.public_key = self.generate_key_pair()
+        self.public_key_str = self.public_key.to_string().hex()
+
+    @staticmethod
+    def generate_key_pair():
+        sk = SigningKey.generate(curve=SECP256k1)
+        vk = sk.verifying_key
+        return sk, vk
+
+    def sign_contribution(self, data: str) -> str:
+        return self.private_key.sign(data.encode()).hex()
+
+    def verify_contribution(self, data: str, signature: str, public_key_str: str) -> bool:
+        vk = SigningKey.from_string(bytes.fromhex(public_key_str), curve=SECP256k1).verifying_key
+        return vk.verify(bytes.fromhex(signature), data.encode())
+
+class L2BitcoinChain:
+    def __init__(self, node_id: str):
+        self.BASE_USD_LIMIT = 1500
+        self.FEE_PERCENTAGE = 0.03
+        self.BASE_YEAR = 2024
+        self.HALVING_INTERVAL = 4
+        self.ANNUAL_LIMIT_INCREASE = 0.15
+        self.BASE_HASH_CONTRIBUTION = 11250000
+        self.BASE_STORAGE_BYTES = 1073741824
+        self.MOORE_RATE = 0.41
+        self.PRUNE_THRESHOLD = datetime.timedelta(days=365)
+        self.current_btc_price = 60000
+        self.chain: List[L2Block] = []
+        self.pending_transactions: List[Dict] = []
+        self.balances: Dict[str, float] = {}
+        self.secondary_addresses: Dict[str, str] = {}
+        self.nodes: Dict[str, Node] = {node_id: Node(node_id)}
+        self.current_node = node_id
+        self.first_node = node_id
+        self.pool_hash = "0" * 64
+        self.total_fees: float = 0
+        self.last_halving_period = -1
+        self.difficulty = 4
+        self.chain.append(L2Block([], "0" * 64, self.pool_hash, self.difficulty))
+        self.update_limits()
+        self.user_wallets: Dict[str, Dict] = {}  # {address: {'seed': str, 'passphrase': str, 'bip32': BIP32Key, 'keys': List[Dict]}}
+
+    def generate_wallet(self, address: str, passphrase: Optional[str] = None) -> str:
+        """Generate a new wallet with a seed phrase and optional passphrase."""
+        mnemo = Mnemonic("english")
+        seed_phrase = mnemo.generate(strength=256)  # 24 words
+        seed = mnemo.to_seed(seed_phrase, passphrase or "")
+        bip32_root = BIP32Key.fromEntropy(seed)
+        # Derive first account key (m/44'/0'/0'/0/0) - Bitcoin mainnet
+        bip32_path = bip32_root.ChildKey(44 + BIP32_HARDEN) \
+                              .ChildKey(0 + BIP32_HARDEN) \
+                              .ChildKey(0 + BIP32_HARDEN) \
+                              .ChildKey(0).ChildKey(0)
+        private_key = SigningKey.from_string(bip32_path.PrivateKey(), curve=SECP256k1)
+        public_key = private_key.verifying_key
+        self.user_wallets[address] = {
+            'seed': seed_phrase,
+            'passphrase': passphrase or "",
+            'bip32': bip32_root,
+            'keys': [{'index': 0, 'private_key': private_key, 'public_key': public_key}]
+        }
+        return seed_phrase
+
+    def restore_wallet(self, address: str, seed_phrase: str, passphrase: Optional[str] = None) -> bool:
+        """Restore a wallet from a seed phrase and optional passphrase."""
+        mnemo = Mnemonic("english")
+        if not mnemo.check(seed_phrase):
+            return False
+        seed = mnemo.to_seed(seed_phrase, passphrase or "")
+        try:
+            bip32_root = BIP32Key.fromEntropy(seed)
+            bip32_path = bip32_root.ChildKey(44 + BIP32_HARDEN) \
+                                  .ChildKey(0 + BIP32_HARDEN) \
+                                  .ChildKey(0 + BIP32_HARDEN) \
+                                  .ChildKey(0).ChildKey(0)
+            private_key = SigningKey.from_string(bip32_path.PrivateKey(), curve=SECP256k1)
+            public_key = private_key.verifying_key
+            self.user_wallets[address] = {
+                'seed': seed_phrase,
+                'passphrase': passphrase or "",
+                'bip32': bip32_root,
+                'keys': [{'index': 0, 'private_key': private_key, 'public_key': public_key}]
+            }
+            return True
+        except Exception:
+            return False
+
+    def generate_new_address(self, address: str) -> int:
+        """Generate a new key pair for the wallet at the next index."""
+        if address not in self.user_wallets:
+            raise ValueError(f"Wallet for {address} not found")
+        wallet = self.user_wallets[address]
+        next_index = max(key['index'] for key in wallet['keys']) + 1
+        bip32_path = wallet['bip32'].ChildKey(44 + BIP32_HARDEN) \
+                                    .ChildKey(0 + BIP32_HARDEN) \
+                                    .ChildKey(0 + BIP32_HARDEN) \
+                                    .ChildKey(0).ChildKey(next_index)
+        private_key = SigningKey.from_string(bip32_path.PrivateKey(), curve=SECP256k1)
+        public_key = private_key.verifying_key
+        wallet['keys'].append({'index': next_index, 'private_key': private_key, 'public_key': public_key})
+        return next_index
+
+    def get_current_year(self) -> int:
+        return datetime.datetime.now().year
+
+    def get_halving_periods_elapsed(self) -> int:
+        years_elapsed = self.get_current_year() - self.BASE_YEAR
+        return years_elapsed // self.HALVING_INTERVAL
+
+    def calculate_min_hash_contribution(self) -> int:
+        periods_elapsed = self.get_halving_periods_elapsed()
+        return int(self.BASE_HASH_CONTRIBUTION * (1 + self.MOORE_RATE) ** (periods_elapsed * self.HALVING_INTERVAL))
+
+    def calculate_storage_requirement(self) -> int:
+        periods_elapsed = self.get_halving_periods_elapsed()
+        return int(self.BASE_STORAGE_BYTES * (1 + self.MOORE_RATE) ** (periods_elapsed * self.HALVING_INTERVAL))
+
+    def calculate_wallet_limit_increase(self) -> float:
+        periods_elapsed = self.get_halving_periods_elapsed()
+        years_since_base = periods_elapsed * self.HALVING_INTERVAL
+        return self.BASE_USD_LIMIT * (1 + self.ANNUAL_LIMIT_INCREASE) ** years_since_base
+
+    def vote_on_limit_increase(self):
+        current_period = self.get_halving_periods_elapsed()
+        if current_period > self.last_halving_period:
+            votes = {}
+            for node_id, node in self.nodes.items():
+                vote_data = f"{current_period}{node.vote_for_limit_increase}"
+                votes[node_id] = (node.sign_contribution(vote_data), node.public_key_str)
+            valid_votes = sum(1 for node_id, (sig, pk) in votes.items() 
+                            if self.nodes[node_id].verify_contribution(f"{current_period}{self.nodes[node_id].vote_for_limit_increase}", sig, pk)
+                            and self.nodes[node_id].vote_for_limit_increase)
+            if valid_votes > len(self.nodes) / 2:
+                self.BASE_USD_LIMIT = self.calculate_wallet_limit_increase()
+            self.last_halving_period = current_period
+
+    def set_node_vote(self, node_id: str, vote: bool):
+        if node_id in self.nodes:
+            self.nodes[node_id].vote_for_limit_increase = vote
+
+    def update_limits(self):
+        self.vote_on_limit_increase()
+        self.SOFT_LIMIT = self.BASE_USD_LIMIT / self.current_btc_price
+        self.MIN_HASH_CONTRIBUTION = self.calculate_min_hash_contribution()
+        self.STORAGE_REQUIREMENT = self.calculate_storage_requirement()
+
+    def simulate_price_update(self):
+        self.current_btc_price = max(10000, min(200000, self.current_btc_price * (1 + random.uniform(-0.1, 0.1))))
+        self.update_limits()
+
+    def add_node(self, node_id: str, latency: float):
+        self.nodes[node_id] = Node(node_id, latency)
+
+    def set_secondary_address(self, primary: str, secondary: str):
+        self.secondary_addresses[primary] = secondary
+
+    def create_block(self, transactions: List[Dict]) -> L2Block:
+        block = L2Block(transactions, self.chain[-1].hash if self.chain else "0" * 64, self.pool_hash, self.difficulty)
+        self.chain.append(block)
+        self.prune_chain()
+        return block
+
+    def prune_chain(self):
+        current_time = datetime.datetime.now()
+        new_chain = [self.chain[0]]
+        for block in self.chain[1:]:
+            if current_time - datetime.datetime.fromtimestamp(block.timestamp) <= self.PRUNE_THRESHOLD:
+                new_chain.append(block)
+        self.chain = new_chain
+
+    def select_fastest_node(self) -> str:
+        return min(self.nodes.items(), key=lambda x: x[1].latency)[0]
+
+    def contribute_to_pool(self, node_id: str):
+        node = self.nodes[node_id]
+        contribution_data = f"{self.pool_hash}{node_id}{time.time()}"
+        signature = node.sign_contribution(contribution_data)
+        if node.verify_contribution(contribution_data, signature, node.public_key_str):
+            self.pool_hash = sha256(f"{self.pool_hash}{signature}".encode()).hexdigest()
+            node.hash_contribution += self.MIN_HASH_CONTRIBUTION
+            time.sleep(node.latency)
+
+    def validate_and_split_transaction(self, sender: str, amount: float, receiver: str, tx_id: str, 
+                                     confirming_node: str, signature: str, sender_public_key: str, key_index: int = 0) -> List[Dict]:
+        self.simulate_price_update()
+        if confirming_node not in self.nodes or sender not in self.user_wallets:
+            return []
+        
+        wallet = self.user_wallets[sender]
+        key = next((k for k in wallet['keys'] if k['index'] == key_index), None)
+        if not key or sender_public_key != key['public_key'].to_string().hex():
+            return []
+        
+        sender_vk = SigningKey.from_string(bytes.fromhex(sender_public_key), curve=SECP256k1).verifying_key
+        tx_data = f"{sender}{receiver}{amount}{tx_id}"
+        if not sender_vk.verify(bytes.fromhex(signature), tx_data.encode()):
+            return []
+
+        is_first_node = confirming_node == self.first_node
+        usd_amount = amount * self.current_btc_price
+        fee_usd = usd_amount * self.FEE_PERCENTAGE
+        fee_btc = fee_usd / self.current_btc_price if is_first_node else 0
+        
+        if self.balances.get(sender, 0) < amount + fee_btc:
+            return []
+        
+        receiver_balance = self.balances.get(receiver, 0)
+        transactions = []
+        primary_amount = min(amount, max(0, self.SOFT_LIMIT - receiver_balance))
+        
+        if primary_amount > 0:
+            tx = {
+                'sender': sender,
+                'receiver': receiver,
+                'amount': primary_amount,
+                'timestamp': time.time(),
+                'tx_id': tx_id,
+                'node_id': confirming_node,
+                'signature': signature,
+                'sender_public_key': sender_public_key,
+                'key_index': key_index
+            }
+            if is_first_node:
+                tx['node_fee'] = fee_btc
+                self.total_fees += fee_btc
+            self.contribute_to_pool(confirming_node)
+            transactions.append(tx)
+        
+        excess_amount = amount - primary_amount
+        if excess_amount > 0 and receiver in self.secondary_addresses:
+            excess_tx_id = f"{tx_id}_excess"
+            excess_signature = wallet['keys'][key_index]['private_key'].sign(f"{sender}{self.secondary_addresses[receiver]}{excess_amount}{excess_tx_id}".encode()).hex()
+            tx = {
+                'sender': sender,
+                'receiver': self.secondary_addresses[receiver],
+                'amount': excess_amount,
+                'timestamp': time.time(),
+                'tx_id': excess_tx_id,
+                'node_id': confirming_node,
+                'signature': excess_signature,
+                'sender_public_key': sender_public_key,
+                'key_index': key_index,
+                'note': 'excess redirect'
+            }
+            self.contribute_to_pool(confirming_node)
+            transactions.append(tx)
+        return transactions
+
+    def add_transaction(self, sender: str, amount: float, receiver: str, 
+                       preferred_node: Optional[str] = None, use_fastest: bool = False, key_index: int = 0) -> bool:
+        if sender not in self.user_wallets:
+            seed_phrase = self.generate_wallet(sender)
+            print(f"New wallet for {sender}. Seed phrase (BACK UP SECURELY - SIMULATED OUTPUT): {seed_phrase}")
+        
+        wallet = self.user_wallets[sender]
+        if key_index >= len(wallet['keys']):
+            self.generate_new_address(sender)
+        
+        tx_id = sha256(f"{sender}{receiver}{amount}{time.time()}".encode()).hexdigest()[:8]
+        node_id = preferred_node if preferred_node else (self.select_fastest_node() if use_fastest else self.current_node)
+        
+        key = wallet['keys'][key_index]
+        signature = key['private_key'].sign(f"{sender}{receiver}{amount}{tx_id}".encode()).hex()
+        sender_public_key = key['public_key'].to_string().hex()
+        
+        transactions = self.validate_and_split_transaction(sender, amount, receiver, tx_id, node_id, signature, sender_public_key, key_index)
+        if not transactions:
+            return False
+        
+        for node_id in self.nodes:
+            if node_id != transactions[0]['node_id']:
+                self.contribute_to_pool(node_id)
+        
+        for tx in transactions:
+            self.pending_transactions.append(tx)
+            fee = tx.get('node_fee', 0)
+            self.balances[tx['sender']] = self.balances.get(tx['sender'], 0) - tx['amount'] - fee
+            self.balances[tx['receiver']] = self.balances.get(tx['receiver'], 0) + tx['amount']
+        
+        if self.should_batch_to_bitcoin():
+            self.batch_to_bitcoin()
+        return True
+
+    def should_batch_to_bitcoin(self) -> bool:
+        return not self.chain or (datetime.datetime.now() - datetime.datetime.fromtimestamp(self.chain[-1].timestamp)) >= datetime.timedelta(days=30)
+
+    def batch_to_bitcoin(self):
+        if self.pending_transactions:
+            self.create_block(self.pending_transactions.copy())
+            print(f"Submitting to Bitcoin network: {json.dumps({'type': 'L2_batch', 'block_hash': self.chain[-1].hash, 'merkle_root': self.chain[-1].merkle_root, 'timestamp': time.time()})}")
+            self.pending_transactions = []
+
+    def get_balance(self, address: str) -> float:
+        return self.balances.get(address, 0)
+
+    def get_node_contribution(self, node_id: str) -> int:
+        return self.nodes.get(node_id, Node("")).hash_contribution
+
+    def get_total_fees(self) -> float:
+        return self.total_fees
+
+    def get_current_limits(self) -> Dict[str, float]:
+        return {
+            'btc_price': self.current_btc_price,
+            'soft_limit': self.SOFT_LIMIT,
+            'fee_percentage': self.FEE_PERCENTAGE,
+            'min_hash_contribution': self.MIN_HASH_CONTRIBUTION,
+            'storage_requirement_bytes': self.STORAGE_REQUIREMENT,
+            'base
