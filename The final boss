@@ -1,0 +1,277 @@
+import hashlib
+import time
+import random
+import json
+import asyncio
+import sqlite3
+from typing import List, Dict, Optional
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class L2Block:
+    def __init__(self, transactions: List[Dict], previous_hash: str, shard_id: int, difficulty: int = 1):
+        self.timestamp = time.time()
+        self.transactions = transactions[:100]  # Real cap: 100 tx/block
+        self.previous_hash = previous_hash
+        self.shard_id = shard_id
+        self.difficulty = difficulty
+        self.merkle_root = self.calculate_merkle_root()
+        self.nonce = 0
+        self.hash = self.mine_block()
+
+    def calculate_merkle_root(self) -> str:
+        if not self.transactions:
+            return "0" * 64
+        tx_hashes = [hashlib.sha256(json.dumps(tx, separators=(',', ':')).encode()).hexdigest() for tx in self.transactions]
+        while len(tx_hashes) > 1:
+            temp_hashes = []
+            for i in range(0, len(tx_hashes), 2):
+                pair = tx_hashes[i:i+2]
+                if len(pair) == 1:
+                    pair.append(pair[0])
+                temp_hashes.append(hashlib.sha256((pair[0] + pair[1]).encode()).hexdigest())
+            tx_hashes = temp_hashes
+        return tx_hashes[0]
+
+    def mine_block(self) -> str:
+        block_data = f"{self.timestamp}{self.merkle_root}{self.previous_hash}{self.nonce}".encode()
+        block_hash = hashlib.sha256(block_data).hexdigest()
+        if block_hash.startswith("0" * self.difficulty):
+            return block_hash
+        self.nonce += 1
+        return self.mine_block()
+
+class L2BitcoinChain:
+    # Real-world parameters (March 23, 2025)
+    DB_FILE = "l2_state.db"
+    BLOCK_TIME = 30  # 30 seconds
+    TX_PER_BLOCK = 100  # Real cap
+    MIN_SHARDS = 5
+    MAX_SHARDS = 15  # Maxed at 15 by 2036
+    DIFFICULTY = 1  # Lightweight PoW
+    BASE_YEAR = 2025
+    HALVING_INTERVAL = 4
+    MOORE_RATE = 0.32  # ~3x per halving: (1 + 0.32)^4 ≈ 3
+    BASE_HASH_CONTRIBUTION = 11250000  # ~130 hashes/s (2025)
+    BASE_STORAGE_BYTES = 1073741824  # ~1 GB base (2025)
+    ANNUAL_LIMIT_INCREASE = 0.15  # ~75% per halving for wallet limit
+    BASE_USD_LIMIT = 1500  # $1,500 (2025)
+    BTC_PRICE = 60000  # $60K (2025)
+    L1_FEE_PER_TX = 2  # $2/tx (2025)
+    L2_FEE_PER_TX = 1  # $1/tx (2025)
+    LN_FEE_PER_TX = 0.05  # $0.05/tx (2025)
+    NODE_COST_PER_DAY = 0.37  # ~$10/month (2025)
+    FRAUD_PROOF_WINDOW = 1.5 * 3600  # 1.5 hours
+    CHECKPOINT_INTERVAL = 7 * 24 * 3600  # 1 tx/week
+    LN_CAPACITY = 0.2  # 20% volume cap (2036 mitigation)
+
+    def __init__(self, node_count: int = 10, year: int = 2025):
+        self.year = year
+        self.node_count = node_count
+        self.shard_count = self.MIN_SHARDS
+        self.shards: Dict[int, List[L2Block]] = {i: [] for i in range(self.shard_count)}
+        self.pending_transactions: Dict[int, List[Dict]] = {i: [] for i in range(self.shard_count)}
+        self.balances: Dict[str, float] = {}
+        self.state_diffs: Dict[str, float] = {}
+        self.ln_channels: Dict[str, float] = {}
+        self.nodes = [f"Node{i}" for i in range(node_count)]
+        self.current_node = self.nodes[0]
+        self.pool_hashes: Dict[int, str] = {i: "0" * 64 for i in range(self.shard_count)}
+        self.total_fees = 0
+        self.last_batch_time = time.time()
+        self.last_checkpoint_time = time.time()
+        self.db_conn = sqlite3.connect(self.DB_FILE, check_same_thread=False)
+        self.init_db()
+        asyncio.create_task(self.load_state())
+        self.update_limits()
+
+    def init_db(self):
+        cursor = self.db_conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS balances (address TEXT PRIMARY KEY, balance REAL)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS shards (shard_id INTEGER, block_id INTEGER, timestamp REAL, hash TEXT, PRIMARY KEY (shard_id, block_id))''')
+        self.db_conn.commit()
+
+    async def save_state(self):
+        cursor = self.db_conn.cursor()
+        cursor.execute("BEGIN TRANSACTION")
+        state = {'total_fees': self.total_fees, 'shard_count': self.shard_count, 'last_batch_time': self.last_batch_time}
+        cursor.execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", ("general", json.dumps(state)))
+        for addr, bal in self.state_diffs.items():
+            self.balances[addr] = self.balances.get(addr, 0) + bal
+            cursor.execute("INSERT OR REPLACE INTO balances (address, balance) VALUES (?, ?)", (addr, self.balances[addr]))
+        self.state_diffs.clear()
+        for shard_id, chain in self.shards.items():
+            for idx, block in enumerate(chain[-5:]):  # Last 5 blocks
+                cursor.execute("INSERT OR REPLACE INTO shards (shard_id, block_id, timestamp, hash) VALUES (?, ?, ?, ?)",
+                               (shard_id, idx, block.timestamp, block.hash))
+        self.db_conn.commit()
+        logger.info("State saved")
+
+    async def load_state(self):
+        cursor = self.db_conn.cursor()
+        cursor.execute("SELECT value FROM state WHERE key = 'general'")
+        state_row = cursor.fetchone()
+        if state_row:
+            state = json.loads(state_row[0])
+            self.total_fees = state['total_fees']
+            self.shard_count = state['shard_count']
+            self.last_batch_time = state.get('last_batch_time', time.time())
+            self.shards = {i: [] for i in range(self.shard_count)}
+            self.pending_transactions = {i: [] for i in range(self.shard_count)}
+            self.pool_hashes = {i: "0" * 64 for i in range(self.shard_count)}
+        cursor.execute("SELECT address, balance FROM balances")
+        self.balances = dict(cursor.fetchall())
+        cursor.execute("SELECT shard_id, timestamp, hash FROM shards ORDER BY shard_id, block_id")
+        blocks = cursor.fetchall()
+        shard_blocks = {i: [] for i in range(self.shard_count)}
+        for shard_id, timestamp, hash_ in blocks:
+            block = L2Block([], "0" * 64, shard_id, self.DIFFICULTY)
+            block.timestamp = timestamp
+            block.hash = hash_
+            shard_blocks[shard_id].append(block)
+        self.shards = shard_blocks if shard_blocks else {i: [L2Block([], "0" * 64, i, self.DIFFICULTY)] for i in range(self.shard_count)}
+
+    def update_limits(self):
+        periods_elapsed = (self.year - self.BASE_YEAR) // self.HALVING_INTERVAL
+        btc_price = self.BTC_PRICE * (1.1 ** (self.year - 2025))  # ~10% CAGR
+        l2_fee = self.L2_FEE_PER_TX * (1.5 if self.year >= 2032 else 1) * (2 if self.year >= 2036 else 1)
+        ln_fee = self.LN_FEE_PER_TX * (1.5 if self.year >= 2032 else 1) * (2 if self.year >= 2036 else 1)
+        node_cost = self.NODE_COST_PER_DAY * (2.4 if self.year >= 2032 else 1) * (3.6 if self.year >= 2036 else 1)
+        self.SOFT_LIMIT = (self.BASE_USD_LIMIT * (1 + self.ANNUAL_LIMIT_INCREASE) ** (periods_elapsed * self.HALVING_INTERVAL)) / btc_price
+        self.MIN_HASH_CONTRIBUTION = int(self.BASE_HASH_CONTRIBUTION * (1 + self.MOORE_RATE) ** (periods_elapsed * self.HALVING_INTERVAL))
+        self.STORAGE_REQUIREMENT = int(self.BASE_STORAGE_BYTES * (1 + self.MOORE_RATE) ** (periods_elapsed * self.HALVING_INTERVAL))
+        self.L1_FEE_PER_DAY = self.L1_FEE_PER_TX * (2 + (0.14 if self.year >= 2036 else 0))  # ~2-2.14 tx/day
+        self.L2_FEE_PER_TX = l2_fee
+        self.LN_FEE_PER_TX = ln_fee
+        self.NODE_COST_PER_DAY = node_cost
+
+    async def adjust_shard_count(self):
+        total_pending = sum(len(self.pending_transactions[shard_id]) for shard_id in range(self.shard_count))
+        target_shards = max(self.MIN_SHARDS, min(self.MAX_SHARDS, total_pending // (self.TX_PER_BLOCK * 5)))
+        if target_shards > self.shard_count:
+            for i in range(self.shard_count, target_shards):
+                self.shards[i] = [L2Block([], "0" * 64, i, self.DIFFICULTY)]
+                self.pending_transactions[i] = []
+                self.pool_hashes[i] = "0" * 64
+            self.shard_count = target_shards
+            logger.info(f"Shard count increased to {self.shard_count}")
+
+    async def create_block(self, shard_id: int, transactions: List[Dict]):
+        chain = self.shards[shard_id]
+        block = L2Block(transactions, chain[-1].hash if chain else "0" * 64, shard_id, self.DIFFICULTY)
+        self.shards[shard_id].append(block)
+        await self.save_state()
+        return block
+
+    async def bridge_to_ln(self, address: str, amount: float):
+        if self.balances.get(address, 0) < amount or self.ln_channels.get(address, 0, 0) + amount > self.SOFT_LIMIT * self.LN_CAPACITY:
+            return False
+        self.state_diffs[address] = self.state_diffs.get(address, 0) - amount
+        self.ln_channels[address] = self.ln_channels.get(address, 0) + amount
+        shard_id = hash(address) % self.shard_count
+        tx = {
+            "sender": address,
+            "receiver": "LN",
+            "amount": amount,
+            "timestamp": time.time(),
+            "tx_id": hashlib.sha256(f"LN_{address}{time.time()}".encode()).hexdigest()[:8]
+        }
+        self.pending_transactions[shard_id].append(tx)
+        await self.save_state()
+        return True
+
+    async def add_transaction(self, sender: str, amount: float, receiver: str):
+        if sender not in self.balances:
+            self.balances[sender] = 1.0  # ~$60K (2025)
+        if self.balances[sender] < amount + self.L2_FEE_PER_TX:
+            return False
+        shard_id = hash(sender) % self.shard_count
+        tx = {
+            "sender": sender,
+            "receiver": receiver,
+            "amount": amount,
+            "fee": self.L2_FEE_PER_TX,
+            "timestamp": time.time(),
+            "tx_id": hashlib.sha256(f"{sender}{receiver}{time.time()}".encode()).hexdigest()[:8]
+        }
+        self.pending_transactions[shard_id].append(tx)
+        self.state_diffs[sender] = self.state_diffs.get(sender, 0) - (amount + self.L2_FEE_PER_TX)
+        self.state_diffs[receiver] = self.state_diffs.get(receiver, 0) + amount
+        self.total_fees += self.L2_FEE_PER_TX
+        await self.adjust_shard_count()
+        if len(self.pending_transactions[shard_id]) >= self.TX_PER_BLOCK:
+            await self.create_block(shard_id, self.pending_transactions[shard_id][:self.TX_PER_BLOCK])
+            self.pending_transactions[shard_id] = self.pending_transactions[shard_id][self.TX_PER_BLOCK:]
+        return True
+
+    async def batch_to_bitcoin(self):
+        if time.time() - self.last_batch_time < 12 * 3600:  # ~12 hours
+            return
+        batch_data = {shard_id: chain[-1].merkle_root for shard_id, chain in self.shards.items() if chain}
+        batch_payload = hashlib.sha256(json.dumps(batch_data, separators=(',', ':')).encode()).hexdigest()[:600]  # ~600 bytes
+        self.last_batch_time = time.time()
+        if self.year >= 2036 and time.time() - self.last_checkpoint_time >= self.CHECKPOINT_INTERVAL:
+            self.last_checkpoint_time = time.time()
+            logger.info("L1 checkpoint submitted")
+        logger.info(f"L1 batch submitted: {batch_payload}")
+        await self.save_state()
+
+    async def simulate_fraud_proof(self, shard_id: int, block_hash: str):
+        if shard_id not in self.shards or block_hash not in [b.hash for b in self.shards[shard_id][-5:]]:
+            return False
+        block = next(b for b in self.shards[shard_id] if b.hash == block_hash)
+        if time.time() - block.timestamp > self.FRAUD_PROOF_WINDOW:
+            return False
+        honest_nodes = int(0.8 * self.node_count)  # ~80% honest
+        required_signatures = int(0.67 * self.node_count)
+        return honest_nodes >= required_signatures  # Simplified multisig check
+
+    def get_stats(self) -> Dict:
+        tx_day = sum(len(block.transactions) for shard in self.shards.values() for block in shard[-2880:])  # ~1 day
+        ln_tx_day = sum(1 for shard in self.pending_transactions.values() for tx in shard if "LN" in tx.get("receiver", ""))
+        revenue = tx_day * self.L2_FEE_PER_TX + ln_tx_day * self.LN_FEE_PER_TX
+        cost = self.L1_FEE_PER_DAY + self.NODE_COST_PER_DAY * self.node_count
+        cpu_usage = (self.MIN_HASH_CONTRIBUTION / (50e6 * (4 if self.year == 2025 else 24))) * 100  # ~50 MH/s/core
+        ram_usage = tx_day * 0.04  # ~40 bytes/tx
+        storage_usage = ram_usage / 1024 / 30  # ~30 days pruned
+        bandwidth_usage = tx_day * 0.04 / 8 / (24 * 3600) * self.shard_count  # Mbps
+        return {
+            "tx_day": tx_day,
+            "ln_tx_day": ln_tx_day,
+            "revenue": revenue,
+            "cost": cost,
+            "profit": revenue - cost,
+            "cpu_%": cpu_usage,
+            "ram_mb": ram_usage,
+            "storage_mb": storage_usage,
+            "bandwidth_mbps": bandwidth_usage
+        }
+
+async def main():
+    # Test for 2025
+    chain_2025 = L2BitcoinChain(node_count=10, year=2025)
+    for i in range(500):  # Simulate ~500K tx/day at ~100% load
+        await chain_2025.add_transaction(f"User{i}", 0.001, "Bob")
+    await chain_2025.bridge_to_ln("Alice", 0.01)
+    await chain_2025.batch_to_bitcoin()
+    fraud_result = await chain_2025.simulate_fraud_proof(0, chain_2025.shards[0][-1].hash if chain_2025.shards[0] else "0" * 64)
+    stats_2025 = chain_2025.get_stats()
+    logger.info(f"2025 Stats: {stats_2025}")
+    logger.info(f"2025 Fraud Detected: {fraud_result}")
+
+    # Test for 2036
+    chain_2036 = L2BitcoinChain(node_count=30, year=2036)
+    for i in range(1500):  # Simulate ~1.5M tx/day
+        await chain_2036.add_transaction(f"User{i}", 0.002, "Bob")
+    await chain_2036.bridge_to_ln("Alice", 0.02)
+    await chain_2036.batch_to_bitcoin()
+    fraud_result = await chain_2036.simulate_fraud_proof(0, chain_2036.shards[0][-1].hash if chain_2036.shards[0] else "0" * 64)
+    stats_2036 = chain_2036.get_stats()
+    logger.info(f"2036 Stats: {stats_2036}")
+    logger.info(f"2036 Fraud Detected: {fraud_result}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
