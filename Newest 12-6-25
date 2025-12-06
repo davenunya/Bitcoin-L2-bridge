@@ -29,7 +29,7 @@ using namespace std;
 
 static string hex_from_bytes(const unsigned char* data, size_t len) {
     stringstream ss;
-    for (size_t i = 0; i < len; ++i) ss << hex << setw(2) << setfill('0') << (int)data[i];
+    for (size_t i = 0; i < len; ++i) ss << hex << setw(2) << setfill('0') << (int)(unsigned char)data[i];
     return ss.str();
 }
 
@@ -50,7 +50,7 @@ static int leading_zero_nibbles(const string& hexstr) {
     return count;
 }
 
-// Modular multiply safe for 64-bit
+// Modular multiply safe for 64-bit (uses __uint128_t which is GCC/Clang extension)
 static uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod) {
     __uint128_t res = (__uint128_t)a * (__uint128_t)b;
     return (uint64_t)(res % mod);
@@ -58,10 +58,12 @@ static uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod) {
 
 // Repeated squaring VDF: compute y = x^(2^T) mod N by doing T squarings.
 // This is intentionally simple but depends on x and T and is deterministic and verifiable.
-pair<uint64_t, vector<uint64_t>> pietrzak_vdf_sim(uint64_t x, int T, uint64_t N) {
+// Accepts an optional cancel flag to support cooperative interruption.
+pair<uint64_t, vector<uint64_t>> pietrzak_vdf_sim(uint64_t x, int T, uint64_t N, const atomic<bool>* cancel_flag = nullptr) {
     uint64_t y = x % N;
     vector<uint64_t> proof; // placeholder (could store checkpoints)
     for (int i = 0; i < T; ++i) {
+        if (cancel_flag && cancel_flag->load()) break; // cooperative interruption
         y = modmul(y, y, N);
         // optionally collect some checkpoints for a more sophisticated proof
         if (i % max(1, T / 4) == 0) proof.push_back(y);
@@ -87,15 +89,22 @@ static uint64_t hex_to_u64_trunc(const string& hex) {
     return v;
 }
 
-// ----------------------------- Mock L1 --------------------------------------
+// ----------------------------- Bitcoin Core stub --------------------------
 
-class MockBitcoinCore {
+// Real bitcoind integration would use JSON-RPC over HTTP(S). This stub provides a realistic
+// placeholder where RPC calls and transaction construction can be added later.
+class BitcoinCoreNode {
 public:
     vector<string> tx_pool;
     string best_block = "genesis_hash";
     mutex mtx;
 
+    BitcoinCoreNode() = default;
+
+    // Simulate anchoring an L2 block by creating an OP_RETURN-like tx and updating best_block.
+    // In a real integration this would build a real Bitcoin tx and broadcast it via RPC.
     void anchor_l2_block(const string& l2_hash) {
+        string to_print;
         {
             lock_guard<mutex> g(mtx);
             string tx = "OP_RETURN " + l2_hash;
@@ -103,9 +112,10 @@ public:
             unsigned char digest[SHA256_DIGEST_LENGTH];
             SHA256(reinterpret_cast<const unsigned char*>(tx.c_str()), tx.length(), digest);
             best_block = hex_from_bytes(digest, SHA256_DIGEST_LENGTH);
-            // assemble message under lock, but print after releasing to avoid blocking while holding lock
-            cout << "[L1] Anchored L2 hash " << l2_hash << " -> tx " << best_block << endl;
+            to_print = string("[L1-stub] Anchored L2 hash ") + l2_hash + " -> tx " + best_block;
         }
+        // print outside lock to avoid blocking other threads
+        cout << to_print << endl;
     }
 
     string get_best_block() {
@@ -132,11 +142,16 @@ public:
     }
 
     void detect_and_respond(const string& channel_id) {
-        lock_guard<mutex> g(mtx);
-        if (monitored_channels.find(channel_id) != monitored_channels.end()) {
-            // Simulated action:
-            cout << "[Watchtower " << id << "] Detected breach on " << channel_id << " — broadcasting penalty TX\n";
+        bool should_print = false;
+        string msg;
+        {
+            lock_guard<mutex> g(mtx);
+            if (monitored_channels.find(channel_id) != monitored_channels.end()) {
+                should_print = true;
+                msg = string("[Watchtower ") + id + "] Detected breach on " + channel_id + " — broadcasting penalty TX";
+            }
         }
+        if (should_print) cout << msg << endl;
     }
 };
 
@@ -156,7 +171,7 @@ public:
     int shard_id;
     double stake_balance = 0.0;
     double reputation_score = 100.0;
-    unique_ptr<MockBitcoinCore> l1_node;
+    unique_ptr<BitcoinCoreNode> l1_node;
     Watchtower watchtower;
     map<string, LightningChannel> lightning_channels;
     mutex mtx; // protects node state
@@ -165,7 +180,7 @@ public:
 
     Node(const string& pk, const string& id, int sid, const string& hwid)
         : public_key(pk), node_id(id), shard_id(sid), stake_balance(0.0),
-          reputation_score(100.0), l1_node(make_unique<MockBitcoinCore>()), watchtower("wt_" + id) {
+          reputation_score(100.0), l1_node(make_unique<BitcoinCoreNode>()), watchtower("wt_" + id) {
         // Pre-create a watchtower for this node; watchtower monitors channels on behalf of node
         cout << "[Node] Created node " << node_id << " with watchtower " << watchtower.id << "\n";
     }
@@ -223,10 +238,11 @@ public:
     mutex nodes_mtx; // protects nodes map
 
     // per-shard synchronization for pending queues
-    vector<mutex> shard_mtx;
+    vector<mutex> shard_mtx;                 // protects pending[shard]
     vector<condition_variable> shard_cv;
+    vector<mutex> shard_chain_mtx;          // protects shards[shard]
+    vector<atomic<bool>> shard_cancel;      // per-shard cancellation flags
 
-    mutex chain_mtx; // protects shard chains (shards vector)
     atomic<bool> mining_active = true;
 
     L2BitcoinChain(const Config& c = Config()) : cfg(c) {
@@ -234,6 +250,9 @@ public:
         pending.resize(cfg.shard_count);
         shard_mtx.resize(cfg.shard_count);
         shard_cv.resize(cfg.shard_count);
+        shard_chain_mtx.resize(cfg.shard_count);
+        shard_cancel.resize(cfg.shard_count);
+        for (int i = 0; i < cfg.shard_count; ++i) shard_cancel[i].store(false);
     }
 
     // produce a merkle-like root by hashing concatenated txs (simple)
@@ -246,15 +265,15 @@ public:
 
     // get head hash for shard
     string get_head_hash(int shard_id) {
-        lock_guard<mutex> g(chain_mtx);
+        lock_guard<mutex> g(shard_chain_mtx[shard_id]);
         if (shards[shard_id].empty()) return "genesis_" + to_string(shard_id);
         return shards[shard_id].back().block_hash;
     }
 
-    // Append block in thread-safe manner and anchor to L1 via miner's MockBitcoinCore
+    // Append block in thread-safe manner and anchor to L1 via miner's BitcoinCoreNode
     void append_block(int shard_id, Block&& blk) {
         {
-            lock_guard<mutex> g(chain_mtx);
+            lock_guard<mutex> g(shard_chain_mtx[shard_id]);
             shards[shard_id].push_back(blk);
         }
         // anchor to L1 using miner's L1 node (if miner exists)
@@ -269,22 +288,14 @@ public:
         }
     }
 
-    // Attempt to collect txs for a block (thread-safe)
-    vector<string> collect_txs_for_block_locked(int shard_id, unique_lock<mutex>& lk) {
+    // Attempt to collect txs for a block while holding shard_mtx[shard]
+    vector<string> collect_txs_for_block_locked(int shard_id) {
         vector<string> txs;
-        // assume caller holds shard_mtx[shard_id]
         for (int i = 0; i < cfg.tx_per_block && !pending[shard_id].empty(); ++i) {
             txs.push_back(pending[shard_id].front());
             pending[shard_id].pop();
         }
         return txs;
-    }
-
-    // Public wrapper used by miner_loop (will wait on CV)
-    vector<string> collect_txs_for_block(int shard_id) {
-        // lock is done by caller when using CV wait; fallback: try to lock briefly
-        unique_lock<mutex> lk(shard_mtx[shard_id]);
-        return collect_txs_for_block_locked(shard_id, lk);
     }
 
     // Enqueue tx into pending and notify miner
@@ -312,19 +323,22 @@ public:
             vector<string> txs;
             {
                 unique_lock<mutex> lk(shard_mtx[shard_id]);
-                shard_cv[shard_id].wait(lk, [&]{ return !pending[shard_id].empty() || !mining_active.load(); });
+                shard_cv[shard_id].wait(lk, [&]{ return !pending[shard_id].empty() || !mining_active.load() || shard_cancel[shard_id].load(); });
                 if (pending[shard_id].empty()) {
-                    if (!mining_active.load()) break;
+                    if (!mining_active.load() || shard_cancel[shard_id].load()) break;
                     else continue;
                 }
                 // collect txs while holding the lock
-                txs = collect_txs_for_block_locked(shard_id, lk);
+                txs = collect_txs_for_block_locked(shard_id);
             }
 
             if (txs.empty()) {
                 // nothing to mine; loop back to wait
                 continue;
             }
+
+            // If this shard was cancelled while preparing, skip
+            if (shard_cancel[shard_id].load()) break;
 
             Block blk;
             blk.prev_hash = get_head_hash(shard_id);
@@ -335,16 +349,20 @@ public:
             uint64_t x = hex_to_u64_trunc(blk.merkle);
             blk.vdf_x = x % cfg.vdf_N;
             int T = cfg.vdf_T;
-            // compute VDF (heavy-ish depending on T)
-            auto [y, proof] = pietrzak_vdf_sim(blk.vdf_x, T, cfg.vdf_N);
+            // compute VDF (heavy-ish depending on T) with cooperative interruption
+            auto [y, proof] = pietrzak_vdf_sim(blk.vdf_x, T, cfg.vdf_N, &shard_cancel[shard_id]);
             blk.vdf_y = y;
+
+            // If cancelled during VDF, skip mining
+            if (shard_cancel[shard_id].load()) break;
 
             // Now PoW-like mining: find nonce such that sha256(prev + merkle + vdf_y + nonce) has >= difficulty leading hex zeros
             uint64_t nonce = 0;
             string hash_hex;
             int difficulty = static_cast<int>(round(cfg.base_pow_difficulty));
-            const uint64_t CHECK_PERIOD = 1024;
+            const uint64_t CHECK_PERIOD = 256; // more frequent cooperative checks
             while (true) {
+                if (shard_cancel[shard_id].load()) break;
                 string payload = blk.prev_hash + "|" + blk.merkle + "|" + to_string(blk.vdf_y) + "|" + to_string(nonce);
                 hash_hex = sha256_hex(payload);
                 if (leading_zero_nibbles(hash_hex) >= difficulty) break;
@@ -352,6 +370,8 @@ public:
                 // for simulation speed, occasionally re-check stop flag
                 if ((nonce & (CHECK_PERIOD - 1)) == 0 && !mining_active.load()) break;
             }
+            if (shard_cancel[shard_id].load()) break;
+
             blk.nonce = nonce;
             blk.block_hash = hash_hex;
             blk.miner_id = miner_node_id;
@@ -431,9 +451,12 @@ int main() {
         this_thread::sleep_for(chrono::milliseconds(100));
     }
 
-    // signal miners to stop and join
+    // signal miners to stop and join (use per-shard cancel flags)
     chain.mining_active.store(false);
-    for (int s = 0; s < cfg.shard_count; ++s) chain.shard_cv[s].notify_all();
+    for (int s = 0; s < cfg.shard_count; ++s) {
+        chain.shard_cancel[s].store(true);
+        chain.shard_cv[s].notify_all();
+    }
     for (auto &t : miners) if (t.joinable()) t.join();
 
     // simulate a channel breach to exercise watchtower
@@ -449,7 +472,7 @@ int main() {
     // brief evaluation outputs
     cout << "\n=== Chain Summary ===\n";
     for (int s = 0; s < cfg.shard_count; ++s) {
-        lock_guard<mutex> g(chain.chain_mtx);
+        lock_guard<mutex> g(chain.shard_chain_mtx[s]);
         cout << "Shard " << s << " blocks: " << chain.shards[s].size() << "\n";
     }
 
