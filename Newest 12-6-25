@@ -1,0 +1,401 @@
+// l2_sim.cpp
+// Single-file L2 simulation with Watchtower, basic consensus (PoW-like), and VDF that depends on input.
+// Compile: g++ -std=c++17 l2_sim.cpp -pthread -lssl -lcrypto -O2 -o l2_sim
+
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <random>
+#include <mutex>
+#include <future>
+#include <atomic>
+#include <fstream>
+#include <map>
+#include <set>
+#include <cmath>
+#include <openssl/sha.h>
+#include <sstream>
+#include <iomanip>
+
+using namespace std;
+
+// ----------------------------- Utilities -----------------------------------
+
+static string hex_from_bytes(const unsigned char* data, size_t len) {
+    stringstream ss;
+    for (size_t i = 0; i < len; ++i) ss << hex << setw(2) << setfill('0') << (int)data[i];
+    return ss.str();
+}
+
+static string sha256_hex(const string& s) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), digest);
+    return hex_from_bytes(digest, SHA256_DIGEST_LENGTH);
+}
+
+// Count leading zero *nibbles* (hex chars '0') approximation for difficulty.
+// e.g., difficulty 4 means first 4 hex chars must be '0' -> 16 leading zero bits.
+static int leading_zero_nibbles(const string& hexstr) {
+    int count = 0;
+    for (char c : hexstr) {
+        if (c == '0') count++;
+        else break;
+    }
+    return count;
+}
+
+// Modular multiply safe for 64-bit
+static uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod) {
+    __uint128_t res = (__uint128_t)a * (__uint128_t)b;
+    return (uint64_t)(res % mod);
+}
+
+// Repeated squaring VDF: compute y = x^(2^T) mod N by doing T squarings.
+// This is intentionally simple but depends on x and T and is deterministic and verifiable.
+pair<uint64_t, vector<uint64_t>> pietrzak_vdf_sim(uint64_t x, int T, uint64_t N) {
+    uint64_t y = x % N;
+    vector<uint64_t> proof; // placeholder (could store checkpoints)
+    for (int i = 0; i < T; ++i) {
+        y = modmul(y, y, N);
+        // optionally collect some checkpoints for a more sophisticated proof
+        if (i % max(1, T / 4) == 0) proof.push_back(y);
+    }
+    return {y, proof};
+}
+
+bool verify_pietrzak_vdf_sim(uint64_t x, uint64_t y, const vector<uint64_t>& proof, int T, uint64_t N) {
+    // For this simulation, simply recompute and check equality (slow but correct).
+    uint64_t recomputed = x % N;
+    for (int i = 0; i < T; ++i) recomputed = modmul(recomputed, recomputed, N);
+    return recomputed == y;
+}
+
+// Convert hex string to 64-bit numeric (truncated)
+static uint64_t hex_to_u64_trunc(const string& hex) {
+    uint64_t v = 0;
+    // take last 16 hex chars (64 bits) if longer
+    string tail = hex.size() > 16 ? hex.substr(hex.size() - 16) : hex;
+    std::stringstream ss;
+    ss << std::hex << tail;
+    ss >> v;
+    return v;
+}
+
+// ----------------------------- Mock L1 --------------------------------------
+
+class MockBitcoinCore {
+public:
+    vector<string> tx_pool;
+    string best_block = "genesis_hash";
+    mutex mtx;
+
+    void anchor_l2_block(const string& l2_hash) {
+        lock_guard<mutex> g(mtx);
+        string tx = "OP_RETURN " + l2_hash;
+        tx_pool.push_back(tx);
+        unsigned char digest[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(tx.c_str()), tx.length(), digest);
+        best_block = hex_from_bytes(digest, SHA256_DIGEST_LENGTH);
+        // Note: printing while holding lock keeps output consistent
+        cout << "[L1] Anchored L2 hash " << l2_hash << " -> tx " << best_block << endl;
+    }
+
+    string get_best_block() {
+        lock_guard<mutex> g(mtx);
+        return best_block;
+    }
+};
+
+// ----------------------------- Watchtower ----------------------------------
+
+class Watchtower {
+public:
+    string id;
+    // watchlist of channel IDs -> victim data
+    mutex mtx;
+    set<string> monitored_channels;
+
+    Watchtower(const string& wid = "") : id(wid) {}
+
+    void monitor_channel(const string& channel_id) {
+        lock_guard<mutex> g(mtx);
+        monitored_channels.insert(channel_id);
+        // In a real system we'd store justice transactions encrypted etc.
+    }
+
+    void detect_and_respond(const string& channel_id) {
+        lock_guard<mutex> g(mtx);
+        if (monitored_channels.find(channel_id) != monitored_channels.end()) {
+            // Simulated action:
+            cout << "[Watchtower " << id << "] Detected breach on " << channel_id << " — broadcasting penalty TX\n";
+        }
+    }
+};
+
+// ----------------------------- Node ----------------------------------------
+
+struct LightningChannel {
+    string id;
+    double balance_local;
+    double balance_remote;
+    bool closed = false;
+};
+
+class Node {
+public:
+    string public_key;
+    string node_id;
+    int shard_id;
+    double stake_balance = 0.0;
+    double reputation_score = 100.0;
+    unique_ptr<MockBitcoinCore> l1_node;
+    Watchtower watchtower;
+    map<string, LightningChannel> lightning_channels;
+    mutex mtx; // protects node state
+
+    Node() = default;
+
+    Node(const string& pk, const string& id, int sid, const string& hwid)
+        : public_key(pk), node_id(id), shard_id(sid), stake_balance(0.0),
+          reputation_score(100.0), l1_node(make_unique<MockBitcoinCore>()), watchtower("wt_" + id) {
+        // Pre-create a watchtower for this node; watchtower monitors channels on behalf of node
+        cout << "[Node] Created node " << node_id << " with watchtower " << watchtower.id << "\n";
+    }
+
+    // Create a lightning channel and register with watchtower
+    void create_lightning_channel(const string& channel_id, double local_balance, double remote_balance) {
+        lock_guard<mutex> g(mtx);
+        LightningChannel ch{channel_id, local_balance, remote_balance, false};
+        lightning_channels[channel_id] = ch;
+        watchtower.monitor_channel(channel_id);
+        cout << "[Node " << node_id << "] Created channel " << channel_id << " (local " << local_balance << ")\n";
+    }
+
+    void simulate_channel_breach(const string& channel_id) {
+        lock_guard<mutex> g(mtx);
+        auto it = lightning_channels.find(channel_id);
+        if (it != lightning_channels.end()) {
+            it->second.closed = true;
+            // trigger watchtower response
+            watchtower.detect_and_respond(channel_id);
+        }
+    }
+};
+
+// ----------------------------- Block & Chain -------------------------------
+
+struct Block {
+    string prev_hash;
+    vector<string> txs;
+    string merkle;
+    uint64_t vdf_x;
+    uint64_t vdf_y;
+    string miner_id;
+    uint64_t nonce;
+    string block_hash;
+    time_t timestamp;
+};
+
+struct Config {
+    int shard_count = 4;
+    double base_pow_difficulty = 3.0; // small for simulation: number of leading zero hex chars
+    int target_block_time = 1; // seconds target
+    int tx_per_block = 5;
+    int vdf_T = 12; // number of squarings (work factor)
+    uint64_t vdf_N = (1ULL << 31) - 1; // prime-like modulus for sim (small)
+};
+
+// L2 chain
+class L2BitcoinChain {
+public:
+    Config cfg;
+    vector<vector<Block>> shards; // chain per shard
+    vector<queue<string>> pending;
+    map<string, Node> nodes;
+    mutex chain_mtx;
+    atomic<bool> mining_active = true;
+
+    L2BitcoinChain(const Config& c = Config()) : cfg(c) {
+        shards.resize(cfg.shard_count);
+        pending.resize(cfg.shard_count);
+    }
+
+    // produce a merkle-like root by hashing concatenated txs (simple)
+    string make_merkle(const vector<string>& txs) {
+        if (txs.empty()) return sha256_hex("EMPTY");
+        string concat;
+        for (auto &t : txs) concat += t + "|";
+        return sha256_hex(concat);
+    }
+
+    // get head hash for shard
+    string get_head_hash(int shard_id) {
+        lock_guard<mutex> g(chain_mtx);
+        if (shards[shard_id].empty()) return "genesis_" + to_string(shard_id);
+        return shards[shard_id].back().block_hash;
+    }
+
+    // Append block in thread-safe manner and anchor to L1 via miner's MockBitcoinCore
+    void append_block(int shard_id, Block&& blk) {
+        {
+            lock_guard<mutex> g(chain_mtx);
+            shards[shard_id].push_back(blk);
+        }
+        // anchor to L1 using miner's L1 node (if miner exists)
+        auto it = nodes.find(blk.miner_id);
+        if (it != nodes.end()) {
+            it->second.l1_node->anchor_l2_block(blk.block_hash);
+        }
+    }
+
+    // Attempt to collect txs for a block (thread-safe)
+    vector<string> collect_txs_for_block(int shard_id) {
+        vector<string> txs;
+        // Take up to tx_per_block from pending[shard_id]
+        // Protect access to pending via chain_mtx
+        lock_guard<mutex> g(chain_mtx);
+        for (int i = 0; i < cfg.tx_per_block && !pending[shard_id].empty(); ++i) {
+            txs.push_back(pending[shard_id].front());
+            pending[shard_id].pop();
+        }
+        return txs;
+    }
+
+    // Mining loop for a shard
+    void miner_loop(int shard_id, const string& miner_node_id) {
+        std::mt19937_64 rng((uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count() ^ shard_id);
+        while (true) {
+            // Collect txs
+            auto txs = collect_txs_for_block(shard_id);
+            if (txs.empty()) {
+                // nothing to mine; check if mining should stop
+                if (!mining_active.load()) break;
+                // sleep briefly and retry
+                this_thread::sleep_for(chrono::milliseconds(50));
+                continue;
+            }
+
+            Block blk;
+            blk.prev_hash = get_head_hash(shard_id);
+            blk.txs = txs;
+            blk.merkle = make_merkle(txs);
+            blk.timestamp = time(nullptr);
+            // derive VDF input x from merkle hash numeric truncation
+            uint64_t x = hex_to_u64_trunc(blk.merkle);
+            blk.vdf_x = x % cfg.vdf_N;
+            int T = cfg.vdf_T;
+            // compute VDF (heavy-ish depending on T)
+            auto [y, proof] = pietrzak_vdf_sim(blk.vdf_x, T, cfg.vdf_N);
+            blk.vdf_y = y;
+
+            // Now PoW-like mining: find nonce such that sha256(prev + merkle + vdf_y + nonce) has >= difficulty leading hex zeros
+            uint64_t nonce = 0;
+            string hash_hex;
+            int difficulty = static_cast<int>(round(cfg.base_pow_difficulty));
+            while (true) {
+                string payload = blk.prev_hash + "|" + blk.merkle + "|" + to_string(blk.vdf_y) + "|" + to_string(nonce);
+                hash_hex = sha256_hex(payload);
+                if (leading_zero_nibbles(hash_hex) >= difficulty) break;
+                ++nonce;
+                // for simulation speed, occasionally re-check stop flag
+                if ((nonce & 0xFFFF) == 0 && !mining_active.load()) break;
+            }
+            blk.nonce = nonce;
+            blk.block_hash = hash_hex;
+            blk.miner_id = miner_node_id;
+
+            // verify VDF (recompute)
+            bool vdf_ok = verify_pietrzak_vdf_sim(blk.vdf_x, blk.vdf_y, proof, T, cfg.vdf_N);
+            if (!vdf_ok) {
+                cout << "[Miner " << miner_node_id << "] VDF verification failed, dropping block\n";
+                continue;
+            }
+
+            // Append block to chain
+            append_block(shard_id, std::move(blk));
+            cout << "[Miner " << miner_node_id << "] Mined block on shard " << shard_id << ", nonce=" << nonce
+                 << ", hash=" << hash_hex.substr(0, 12) << "..., txs=" << txs.size() << "\n";
+
+            // small pause to simulate block interval
+            this_thread::sleep_for(chrono::milliseconds(100));
+        } // while
+    }
+};
+
+// ----------------------------- Main / Simulation ---------------------------
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // seed RNG
+    srand((unsigned)time(nullptr));
+
+    Config cfg;
+    cfg.shard_count = 4;
+    cfg.base_pow_difficulty = 3.0; // small for quick sim
+    cfg.tx_per_block = 5;
+    cfg.vdf_T = 14; // moderate work
+    cfg.vdf_N = (1ULL << 31) - 1;
+
+    L2BitcoinChain chain(cfg);
+
+    // Create nodes (with watchtowers) and register a couple of lightning channels
+    for (int i = 0; i < 3; ++i) {
+        string nid = "node" + to_string(i+1);
+        chain.nodes[nid] = Node("pubkey_" + nid, nid, i % cfg.shard_count, "hw_" + nid);
+        // create a channel and have watchtower monitor it
+        chain.nodes[nid].create_lightning_channel("chan_" + nid + "_A", 100.0 - i*10, 50.0 + i*5);
+    }
+
+    // Populate pending txs across shards
+    const int total_txs = 50;
+    for (int i = 0; i < total_txs; ++i) {
+        int shard = i % cfg.shard_count;
+        lock_guard<mutex> g(chain.chain_mtx);
+        chain.pending[shard].push("tx_" + to_string(i) + "_from_user");
+    }
+
+    // Start miner threads (one per shard) using existing nodes round-robin
+    vector<thread> miners;
+    vector<string> node_ids;
+    for (auto &p : chain.nodes) node_ids.push_back(p.first);
+    int node_count = (int)node_ids.size();
+    for (int s = 0; s < cfg.shard_count; ++s) {
+        string miner_node = node_ids[s % node_count];
+        miners.emplace_back(&L2BitcoinChain::miner_loop, &chain, s, miner_node);
+    }
+
+    // Let miners run until they process all txs; poll pending queues
+    while (true) {
+        bool any_pending = false;
+        {
+            lock_guard<mutex> g(chain.chain_mtx);
+            for (int s = 0; s < cfg.shard_count; ++s) {
+                if (!chain.pending[s].empty()) { any_pending = true; break; }
+            }
+        }
+        if (!any_pending) break;
+        this_thread::sleep_for(chrono::milliseconds(100));
+    }
+
+    // signal miners to stop and join
+    chain.mining_active.store(false);
+    for (auto &t : miners) if (t.joinable()) t.join();
+
+    // simulate a channel breach to exercise watchtower
+    chain.nodes.begin()->second.simulate_channel_breach("chan_" + chain.nodes.begin()->first + "_A");
+
+    // brief evaluation outputs
+    cout << "\n=== Chain Summary ===\n";
+    for (int s = 0; s < cfg.shard_count; ++s) {
+        lock_guard<mutex> g(chain.chain_mtx);
+        cout << "Shard " << s << " blocks: " << chain.shards[s].size() << "\n";
+    }
+
+    cout << "\nDone simulation.\n";
+    return 0;
+}
