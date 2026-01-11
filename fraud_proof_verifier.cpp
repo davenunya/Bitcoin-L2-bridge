@@ -1,142 +1,52 @@
-// fraud_proof_verifier.cpp
-// Helpers for fraud proof building and verification (UTXO-SMT)
+#include "fraud_proof.hpp"
 
-#include <optional>
 #include <string>
-#include <vector>
+#include <cctype>
+#include <cstdint>
 
-// Note: This file assumes the repository defines the following types and functions elsewhere:
-// - FraudProof, Hash32, Hash20, TraceEntry, TraceReply, BlockHeaderLite, MerklePathNode, Tx
-// - verify_header_chain_pow_linkage, merkle_verify_leaf_hash32, hash32_from_hex,
-// - recompute_post_root_from_trace_and_tx, IShardDataProvider
+using namespace bridge;
 
-static bool verify_fraud_proof_utxo_smt(
-    const FraudProof& fp,
-    const std::array<Hash32,257>& smt_defaults,
-    std::string& err
-) {
-    err.clear();
-
-    // 1) verify header chain integrity
-    if (!verify_header_chain_pow_linkage(fp.headers_to_tip)) {
-        err = "bad_header_chain";
-        return false; // malformed
-    }
-
-    // 2) disputed header is the first
-    const auto& disputed_hdr = fp.headers_to_tip.front();
-
-    // 3) verify trace inclusion in disputed block trace_root
-    // Reconstruct leaf hash from TraceEntry
-    Hash32 leaf = fp.entry.leaf_hash(smt_defaults);
-    Hash32 expected_trace_root{};
-    {
-        // trace_root_hex in header -> Hash32
-        // (You likely already have hex->Hash32 helper in your combined file; if not, add one.)
-        expected_trace_root = hash32_from_hex(disputed_hdr.trace_root_hex);
-    }
-    if (!merkle_verify_leaf_hash32(leaf, fp.trace_leaf_path, expected_trace_root)) {
-        err = "trace_inclusion_failed";
-        return false; // malformed
-    }
-
-    // 4) Determine if disputed tx is payout (must be last tx in block)
-    if (fp.block_txids_in_order.empty()) { err = "missing_block_txids"; return false; }
-    if (fp.tx_index >= fp.block_txids_in_order.size()) { err = "tx_index_oob"; return false; }
-
-    const bool is_payout = (fp.tx_index + 1 == fp.block_txids_in_order.size());
-
-    // 5) Need the full tx to re-execute; trace entry must include tx
-    // (In your kernel, TraceEntry currently stores txid + steps only.
-    //  To verify consensus rules, FraudProof must include the tx itself.)
-    // -> FIX: add Tx tx; into TraceEntry or store it in FraudProof alongside entry.
-    //
-    // For now assume FraudProof has fp.tx (add it).
-    //
-    // We'll enforce this as required:
-    // if (fp.tx.vin empty etc) error.
-
-    // 6) Recompute post root and compare: any mismatch => fraud proven
-    Hash32 recomputed_post{};
-    std::string re_err;
-
-    const bool fraud = recompute_post_root_from_trace_and_tx(
-        fp.tx, is_payout, fp.fee_recipient_pkh, fp.block_txids_in_order,
-        fp.entry, smt_defaults, re_err, recomputed_post
-    );
-
-    if (!re_err.empty()) {
-        err = "reexec_failed:" + re_err;
-        return false; // malformed (can't verify)
-    }
-
-    if (fraud) {
-        err.clear();
-        return true; // FRAUD PROVEN
-    }
-
-    err = "no_fraud";
+// Small helper: convert a hex character to its 4-bit nibble value.
+static bool hexCharToNibble(char c, uint8_t &out) {
+    if (c >= '0' && c <= '9') { out = static_cast<uint8_t>(c - '0'); return true; }
+    if (c >= 'a' && c <= 'f') { out = static_cast<uint8_t>(10 + (c - 'a')); return true; }
+    if (c >= 'A' && c <= 'F') { out = static_cast<uint8_t>(10 + (c - 'A')); return true; }
     return false;
 }
 
-
-static std::optional<FraudProof> remote_build_fraud_proof_utxo_smt(
-    IShardDataProvider& prov,
-    uint64_t shard_id,
-    uint64_t disputed_height,
-    uint64_t tx_index
-) {
-    // For now, build proof to current best tip height returned by headers request.
-    // In (4) this becomes "anchored tip height".
-
-    // naive: ask for headers [disputed..disputed] only (just the disputed header)
-    // better: request some tip; but provider API doesn’t expose tip height here yet.
-    // So we assume caller knows a tip height. If not, use disputed only.
-
-    // Minimal version: just disputed header
-    auto hdrs = prov.GetHeaders(shard_id, disputed_height, disputed_height);
-    if (hdrs.empty()) return std::nullopt;
-
-    auto tr = prov.GetTrace(shard_id, disputed_height, tx_index);
-    if (!tr.ok) return std::nullopt;
-
-    auto txids = prov.GetBlockTxids(shard_id, disputed_height);
-    if (txids.empty()) return std::nullopt;
-
-    FraudProof fp;
-    fp.shard_id = shard_id;
-    fp.disputed_height = disputed_height;
-    fp.tx_index = tx_index;
-
-    fp.headers_to_tip = hdrs;
-    fp.entry = tr.entry;
-    fp.trace_leaf_path = tr.path_to_trace_root;
-
-    fp.block_txids_in_order = txids;
-
-    // MUST include tx for consensus reexec:
-    fp.tx = tr.tx; // ensure TraceReply carries tx (add it)
-
-    // fee_recipient_pkh must be derivable (from payout vout[0])
-    // easiest: provider also returns it; or infer from txids by fetching payout tx.
-    // For now, ask provider to return it in TraceReply or in a separate method.
-    fp.fee_recipient_pkh = tr.fee_recipient_pkh;
-
-    return fp;
+// Parse a 64-char hex string into a 32-byte Hash32.
+// Returns true on success, false for invalid length or non-hex input.
+bool parseHexToHash32(const std::string &hex, Hash32 &out) {
+    if (hex.size() != 64) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        uint8_t hi, lo;
+        if (!hexCharToNibble(hex[2*i], hi)) return false;
+        if (!hexCharToNibble(hex[2*i + 1], lo)) return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
 }
 
+// Example verifier stub that uses FraudProof and TraceReply.
+// Replace with real verification logic as needed.
+TraceReply verifyFraudProof(const FraudProof &proof) {
+    TraceReply reply;
 
-struct TraceReply {
-    bool ok=false;
-    std::string err;
-    BlockHeaderLite header;
+    // Basic sanity: ensure id is not all zeros.
+    bool all_zero = true;
+    for (auto b : proof.id) {
+        if (b != 0) { all_zero = false; break; }
+    }
 
-    TraceEntry entry;
-    Tx tx;  // <-- add
-    Hash20 fee_recipient_pkh; // <-- add (block-level)
+    if (all_zero) {
+        reply.ok = false;
+        reply.message = "Invalid proof id (all zeros)";
+        return reply;
+    }
 
-    std::vector<MerklePathNode> path_to_trace_root;
-};
-
-
-// End of fraud_proof_verifier.cpp
+    // TODO: add real fraud verification logic here.
+    reply.ok = true;
+    reply.message = "Proof processed (stub)";
+    reply.trace = proof.raw;
+    return reply;
+}
