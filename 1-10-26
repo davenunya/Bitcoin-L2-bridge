@@ -1,0 +1,2309 @@
+// l2_node_baseA_phase4plus_fraudproof.cpp
+// Base A: UTXO rules + fee sink + payout + topo levels + PoW header chain
+// plus (2) Remote fraud proof build/verify over UTXO-SMT trace steps.
+//
+// Build:
+//   g++ -std=c++20 l2_node_baseA_phase4plus_fraudproof.cpp -O2 -pthread -lssl -lcrypto -o l2node
+//
+// Notes:
+// - Harness / simulation: no real P2P. Provider interface simulates remote access.
+// - Fraud is detected by recomputing expected SMT step roots from proofs + tx contents.
+//
+// What’s included:
+// - COW UTXO treap
+// - P2WPKH signatures (BIP143 SIGHASH_ALL), low-S enforcement
+// - Fee sink rules + payout tx rules
+// - SMT commitment of UTXO set transitions (per-tx trace steps)
+// - Merkle trace_root and inclusion proofs
+// - Header PoW + chain verification
+// - Fraud proof build + verify (single-shot)
+
+#include <openssl/sha.h>
+#include <openssl/ripemd.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/obj_mac.h>
+#include <openssl/bn.h>
+
+#include <array>
+#include <atomic>
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <queue>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+
+// ============================================================
+// Bytes / Hashing
+// ============================================================
+using Bytes  = std::vector<uint8_t>;
+using Hash32 = std::array<uint8_t, 32>;
+using Hash20 = std::array<uint8_t, 20>;
+
+static void append_u32_le(Bytes& b, uint32_t v) {
+    b.push_back((uint8_t)(v));
+    b.push_back((uint8_t)(v >> 8));
+    b.push_back((uint8_t)(v >> 16));
+    b.push_back((uint8_t)(v >> 24));
+}
+static void append_u64_le(Bytes& b, uint64_t v) {
+    for (int i = 0; i < 8; i++) b.push_back((uint8_t)(v >> (8 * i)));
+}
+static void append_bytes(Bytes& b, const Bytes& x) { b.insert(b.end(), x.begin(), x.end()); }
+
+static void append_varint(Bytes& out, uint64_t v) {
+    if (v < 0xFD) out.push_back((uint8_t)v);
+    else if (v <= 0xFFFF) {
+        out.push_back(0xFD);
+        out.push_back((uint8_t)(v));
+        out.push_back((uint8_t)(v >> 8));
+    } else if (v <= 0xFFFFFFFFULL) {
+        out.push_back(0xFE);
+        append_u32_le(out, (uint32_t)v);
+    } else {
+        out.push_back(0xFF);
+        append_u64_le(out, v);
+    }
+}
+
+static Hash32 sha256d(const Bytes& b) {
+    uint8_t h1[32], h2[32];
+    SHA256(b.data(), b.size(), h1);
+    SHA256(h1, 32, h2);
+    Hash32 out{};
+    std::memcpy(out.data(), h2, 32);
+    return out;
+}
+static Hash32 sha256_1(const Bytes& b) {
+    uint8_t h[32];
+    SHA256(b.data(), b.size(), h);
+    Hash32 out{};
+    std::memcpy(out.data(), h, 32);
+    return out;
+}
+static Hash20 hash160(const Bytes& b) {
+    uint8_t h1[32];
+    SHA256(b.data(), b.size(), h1);
+    uint8_t h2[20];
+    RIPEMD160(h1, 32, h2);
+    Hash20 out{};
+    std::memcpy(out.data(), h2, 20);
+    return out;
+}
+
+static bool hash32_eq(const Hash32& a, const Hash32& b) {
+    return std::memcmp(a.data(), b.data(), 32) == 0;
+}
+static std::string hex_of(const Hash32& h) {
+    static const char* d = "0123456789abcdef";
+    std::string s; s.resize(64);
+    for (int i = 0; i < 32; i++) {
+        s[2*i+0] = d[(h[i] >> 4) & 0xF];
+        s[2*i+1] = d[(h[i] >> 0) & 0xF];
+    }
+    return s;
+}
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+static bool hash32_from_hex(const std::string& hex, Hash32& out) {
+    if (hex.size() != 64) return false;
+    for (int i = 0; i < 32; i++) {
+        int hi = hex_nibble(hex[2*i]);
+        int lo = hex_nibble(hex[2*i+1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+// ============================================================
+// Consensus parameters (Base A)
+// ============================================================
+namespace consensus {
+    constexpr size_t  MAX_TXS_PER_BLOCK  = 20'000;
+    constexpr size_t  MAX_INPUTS         = 1000;
+    constexpr size_t  MAX_OUTPUTS        = 2000;
+    constexpr size_t  MAX_WIT_ITEM_BYTES = 10'000;
+
+    // Fees (demo)
+    constexpr uint64_t GOLD_FLOOR_BPS_TENTHS = 3; // 0.3 bps
+    constexpr uint64_t TX_VALUE_BPS_TENTHS   = 2; // 0.2 bps
+}
+
+// Checkpoints every N blocks (demo)
+static constexpr uint64_t CHECKPOINT_INTERVAL = 25;
+
+// Demo PoW difficulty (leading hex zeros on pow hash)
+static constexpr uint64_t POW_DIFFICULTY_ZEROS = 3;
+
+// ============================================================
+// Fee logic
+// ============================================================
+struct FeeSnapshot { uint64_t gold_1oz_price_sats{0}; };
+
+static uint64_t round_mul_div_u64(uint64_t x, uint64_t num, uint64_t den) {
+    __uint128_t v = (__uint128_t)x * num + den / 2;
+    return (uint64_t)(v / den);
+}
+static uint64_t fee_from_bps_tenths(uint64_t base, uint64_t bps_tenths) {
+    return round_mul_div_u64(base, bps_tenths, 100'000);
+}
+
+// ============================================================
+// OutPoint / Tx
+// ============================================================
+struct OutPoint {
+    Hash32   txid{};
+    uint32_t vout{0};
+
+    bool operator<(const OutPoint& o) const {
+        int c = std::memcmp(txid.data(), o.txid.data(), 32);
+        if (c != 0) return c < 0;
+        return vout < o.vout;
+    }
+    bool operator==(const OutPoint& o) const {
+        return (vout == o.vout) && (std::memcmp(txid.data(), o.txid.data(), 32) == 0);
+    }
+};
+
+struct TxIn {
+    OutPoint prevout{};
+    uint32_t sequence{0xFFFFFFFF};
+    Bytes witness_sig;    // DER(sig)+sighash
+    Bytes witness_pubkey; // 33-byte compressed
+};
+
+struct TxOut {
+    uint64_t value{0};
+    Bytes script_pubkey;
+};
+
+struct Tx {
+    int32_t version{2};
+    std::vector<TxIn>  vin;
+    std::vector<TxOut> vout;
+    uint32_t locktime{0};
+    Hash32 txid{};
+};
+
+// ============================================================
+// Script restrictions: P2WPKH + fee sink only
+// ============================================================
+static Bytes fee_sink_scriptpubkey() {
+    Bytes spk;
+    spk.push_back(0x00);
+    spk.push_back(0x14);
+    spk.insert(spk.end(), 20, 0x00);
+    return spk;
+}
+static bool is_fee_sink_spk(const Bytes& spk) { return spk == fee_sink_scriptpubkey(); }
+
+static bool is_p2wpkh_scriptpubkey(const Bytes& spk, Hash20& out_h160) {
+    if (spk.size() != 22) return false;
+    if (spk[0] != 0x00 || spk[1] != 0x14) return false;
+    std::memcpy(out_h160.data(), spk.data() + 2, 20);
+    return true;
+}
+static bool is_p2wpkh_spk(const Bytes& spk) {
+    Hash20 h{};
+    return is_p2wpkh_scriptpubkey(spk, h);
+}
+static Bytes p2wpkh_spk_from_h160(const Hash20& h160) {
+    Bytes spk;
+    spk.push_back(0x00);
+    spk.push_back(0x14);
+    spk.insert(spk.end(), h160.begin(), h160.end());
+    return spk;
+}
+
+// ============================================================
+// Persistent / COW UTXO Set (Treap)
+// ============================================================
+struct Coin { uint64_t value{0}; Bytes script_pubkey; };
+
+struct Undo { OutPoint op{}; bool had_prev{false}; Coin prev{}; };
+
+struct UTXONode {
+    OutPoint key{};
+    Coin val{};
+    uint64_t prio{0};
+    std::shared_ptr<const UTXONode> l;
+    std::shared_ptr<const UTXONode> r;
+};
+
+class UTXOSet {
+public:
+    bool has(const OutPoint& op) const { return find(root_, op) != nullptr; }
+    const Coin* get_ptr(const OutPoint& op) const { return find(root_, op); }
+
+    bool apply_tx(const Tx& tx, std::vector<Undo>& undo, std::string& err) {
+        for (const auto& in : tx.vin) {
+            const Coin* c = find(root_, in.prevout);
+            if (!c) { err = "missing_utxo"; return false; }
+            undo.push_back({in.prevout, true, *c});
+            root_ = erase(root_, in.prevout);
+        }
+        for (uint32_t i = 0; i < (uint32_t)tx.vout.size(); i++) {
+            OutPoint op{tx.txid, i};
+            undo.push_back({op, false, {}});
+            root_ = insert(root_, op, Coin{tx.vout[i].value, tx.vout[i].script_pubkey});
+        }
+        err.clear();
+        return true;
+    }
+
+    void undo_from_log_reverse(const std::vector<Undo>& undo_log) {
+        for (auto it = undo_log.rbegin(); it != undo_log.rend(); ++it) {
+            const Undo& u = *it;
+            if (!u.had_prev) root_ = erase(root_, u.op);
+            else             root_ = insert(root_, u.op, u.prev);
+        }
+    }
+
+private:
+    std::shared_ptr<const UTXONode> root_{nullptr};
+
+    static uint64_t prio_from_key(const OutPoint& k) {
+        Bytes b;
+        b.insert(b.end(), k.txid.begin(), k.txid.end());
+        append_u32_le(b, k.vout);
+        Hash32 h = sha256d(b);
+        uint64_t p = 0;
+        for (int i = 0; i < 8; i++) p |= (uint64_t)h[i] << (8 * i);
+        return p ? p : 1;
+    }
+
+    static std::shared_ptr<const UTXONode> mk(const OutPoint& k, const Coin& v, uint64_t p,
+                                              std::shared_ptr<const UTXONode> l,
+                                              std::shared_ptr<const UTXONode> r) {
+        auto n = std::make_shared<UTXONode>();
+        n->key = k; n->val = v; n->prio = p; n->l = std::move(l); n->r = std::move(r);
+        return n;
+    }
+
+    static int cmp(const OutPoint& a, const OutPoint& b) {
+        int c = std::memcmp(a.txid.data(), b.txid.data(), 32);
+        if (c != 0) return c;
+        if (a.vout < b.vout) return -1;
+        if (a.vout > b.vout) return 1;
+        return 0;
+    }
+
+    static void split(std::shared_ptr<const UTXONode> t, const OutPoint& key,
+                      std::shared_ptr<const UTXONode>& a,
+                      std::shared_ptr<const UTXONode>& b) {
+        if (!t) { a = nullptr; b = nullptr; return; }
+        if (cmp(t->key, key) < 0) {
+            std::shared_ptr<const UTXONode> t2a, t2b;
+            split(t->r, key, t2a, t2b);
+            a = mk(t->key, t->val, t->prio, t->l, t2a);
+            b = t2b;
+        } else {
+            std::shared_ptr<const UTXONode> t2a, t2b;
+            split(t->l, key, t2a, t2b);
+            a = t2a;
+            b = mk(t->key, t->val, t->prio, t2b, t->r);
+        }
+    }
+
+    static std::shared_ptr<const UTXONode> merge(std::shared_ptr<const UTXONode> a,
+                                                 std::shared_ptr<const UTXONode> b) {
+        if (!a) return b;
+        if (!b) return a;
+        if (a->prio > b->prio) {
+            auto nr = merge(a->r, b);
+            return mk(a->key, a->val, a->prio, a->l, nr);
+        } else {
+            auto nl = merge(a, b->l);
+            return mk(b->key, b->val, b->prio, nl, b->r);
+        }
+    }
+
+    static std::shared_ptr<const UTXONode> erase(std::shared_ptr<const UTXONode> t, const OutPoint& key) {
+        if (!t) return nullptr;
+        int c = cmp(key, t->key);
+        if (c == 0) return merge(t->l, t->r);
+        if (c < 0) return mk(t->key, t->val, t->prio, erase(t->l, key), t->r);
+        return mk(t->key, t->val, t->prio, t->l, erase(t->r, key));
+    }
+
+    static std::shared_ptr<const UTXONode> insert(std::shared_ptr<const UTXONode> t,
+                                                  const OutPoint& key, const Coin& val) {
+        t = erase(t, key);
+        auto item = mk(key, val, prio_from_key(key), nullptr, nullptr);
+        std::shared_ptr<const UTXONode> a, b;
+        split(t, key, a, b);
+        return merge(merge(a, item), b);
+    }
+
+    static const Coin* find(std::shared_ptr<const UTXONode> t, const OutPoint& key) {
+        while (t) {
+            int c = cmp(key, t->key);
+            if (c == 0) return &t->val;
+            t = (c < 0) ? t->l : t->r;
+        }
+        return nullptr;
+    }
+};
+
+// ============================================================
+// TXID serialization (witness excluded, empty scriptSig)
+// ============================================================
+static void ser_outpoint(Bytes& out, const OutPoint& op) {
+    out.insert(out.end(), op.txid.begin(), op.txid.end());
+    append_u32_le(out, op.vout);
+}
+static void ser_tx_nw(Bytes& out, const Tx& tx) {
+    append_u32_le(out, (uint32_t)tx.version);
+    append_varint(out, tx.vin.size());
+    for (const auto& in : tx.vin) {
+        ser_outpoint(out, in.prevout);
+        append_varint(out, 0);
+        append_u32_le(out, in.sequence);
+    }
+    append_varint(out, tx.vout.size());
+    for (const auto& o : tx.vout) {
+        append_u64_le(out, o.value);
+        append_varint(out, o.script_pubkey.size());
+        append_bytes(out, o.script_pubkey);
+    }
+    append_u32_le(out, tx.locktime);
+}
+static Hash32 compute_txid(const Tx& tx) {
+    Bytes b;
+    ser_tx_nw(b, tx);
+    return sha256d(b);
+}
+
+// ============================================================
+// BIP143 P2WPKH SIGHASH_ALL helpers
+// ============================================================
+static Bytes scriptcode_p2wpkh(const Hash20& h160) {
+    Bytes sc;
+    sc.push_back(0x76); sc.push_back(0xA9); sc.push_back(0x14);
+    sc.insert(sc.end(), h160.begin(), h160.end());
+    sc.push_back(0x88); sc.push_back(0xAC);
+    return sc;
+}
+static Hash32 hashPrevouts(const Tx& tx) {
+    Bytes cat;
+    for (const auto& in : tx.vin) ser_outpoint(cat, in.prevout);
+    return sha256d(cat);
+}
+static Hash32 hashSequence(const Tx& tx) {
+    Bytes cat;
+    for (const auto& in : tx.vin) append_u32_le(cat, in.sequence);
+    return sha256d(cat);
+}
+static Hash32 hashOutputs(const Tx& tx) {
+    Bytes cat;
+    for (const auto& o : tx.vout) {
+        append_u64_le(cat, o.value);
+        append_varint(cat, o.script_pubkey.size());
+        append_bytes(cat, o.script_pubkey);
+    }
+    return sha256d(cat);
+}
+static Hash32 bip143_sighash_all_p2wpkh_prehashed(const Tx& tx, size_t in_index,
+                                                 const Coin& prevcoin, const Hash20& pubkey_h160,
+                                                 const Hash32& hp, const Hash32& hs, const Hash32& ho,
+                                                 uint32_t sighash_type /*=1*/) {
+    Bytes pre;
+    append_u32_le(pre, (uint32_t)tx.version);
+    pre.insert(pre.end(), hp.begin(), hp.end());
+    pre.insert(pre.end(), hs.begin(), hs.end());
+    ser_outpoint(pre, tx.vin[in_index].prevout);
+
+    Bytes sc = scriptcode_p2wpkh(pubkey_h160);
+    append_varint(pre, sc.size());
+    append_bytes(pre, sc);
+
+    append_u64_le(pre, prevcoin.value);
+    append_u32_le(pre, tx.vin[in_index].sequence);
+    pre.insert(pre.end(), ho.begin(), ho.end());
+    append_u32_le(pre, tx.locktime);
+    append_u32_le(pre, sighash_type);
+    return sha256d(pre);
+}
+
+// ============================================================
+// OpenSSL secp256k1 signing/verify (low-S enforced)
+// ============================================================
+struct KeyPair {
+    EC_KEY* key{nullptr};
+    Bytes pubkey33;
+    Hash20 pkh;
+
+    ~KeyPair() { if (key) EC_KEY_free(key); key = nullptr; }
+    KeyPair(const KeyPair&) = delete;
+    KeyPair& operator=(const KeyPair&) = delete;
+    KeyPair() = default;
+    KeyPair(KeyPair&& o) noexcept : key(o.key), pubkey33(std::move(o.pubkey33)), pkh(o.pkh) { o.key = nullptr; }
+};
+
+static Bytes ec_pubkey_compressed(EC_KEY* key) {
+    Bytes out(33);
+    EC_KEY_set_conv_form(key, POINT_CONVERSION_COMPRESSED);
+    int len = i2o_ECPublicKey(key, nullptr);
+    if (len != 33) throw std::runtime_error("unexpected pubkey len");
+    unsigned char* p = out.data();
+    if (i2o_ECPublicKey(key, &p) != 33) throw std::runtime_error("i2o_ECPublicKey failed");
+    return out;
+}
+static KeyPair generate_keypair() {
+    KeyPair kp;
+    kp.key = EC_KEY_new_by_curve_name(NID_secp256k1);
+    if (!kp.key) throw std::runtime_error("EC_KEY_new_by_curve_name failed");
+    if (EC_KEY_generate_key(kp.key) != 1) throw std::runtime_error("EC_KEY_generate_key failed");
+    kp.pubkey33 = ec_pubkey_compressed(kp.key);
+    kp.pkh = hash160(kp.pubkey33);
+    return kp;
+}
+
+static bool ecdsa_sig_is_low_s(const ECDSA_SIG* sig) {
+    const BIGNUM *r=nullptr, *s=nullptr;
+    ECDSA_SIG_get0(sig, &r, &s);
+    if (!s) return false;
+
+    BIGNUM* n = BN_new();
+    BIGNUM* half = BN_new();
+    if (!n || !half) { if(n)BN_free(n); if(half)BN_free(half); return false; }
+    BN_hex2bn(&n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+    BN_rshift1(half, n);
+    bool ok = (BN_cmp(s, half) <= 0);
+    BN_free(n); BN_free(half);
+    return ok;
+}
+
+static Bytes ecdsa_sign_der_sighashall_lowS(EC_KEY* key, const Hash32& msg32) {
+    ECDSA_SIG* sig = ECDSA_do_sign(msg32.data(), 32, key);
+    if (!sig) throw std::runtime_error("ECDSA_do_sign failed");
+
+    if (!ecdsa_sig_is_low_s(sig)) {
+        const BIGNUM *r=nullptr, *s=nullptr;
+        ECDSA_SIG_get0(sig, &r, &s);
+
+        BIGNUM* n = BN_new();
+        BIGNUM* new_s = BN_new();
+        if (!n || !new_s) throw std::runtime_error("BN alloc failed");
+        BN_hex2bn(&n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+        BN_sub(new_s, n, s);
+
+        ECDSA_SIG* sig2 = ECDSA_SIG_new();
+        if (!sig2) throw std::runtime_error("ECDSA_SIG_new failed");
+        BIGNUM* rdup = BN_dup(r);
+        if (!rdup) throw std::runtime_error("BN_dup failed");
+        if (ECDSA_SIG_set0(sig2, rdup, new_s) != 1) throw std::runtime_error("ECDSA_SIG_set0 failed");
+
+        ECDSA_SIG_free(sig);
+        BN_free(n);
+        sig = sig2;
+    }
+
+    int der_len = i2d_ECDSA_SIG(sig, nullptr);
+    if (der_len <= 0) { ECDSA_SIG_free(sig); throw std::runtime_error("i2d_ECDSA_SIG len failed"); }
+
+    Bytes der((size_t)der_len);
+    unsigned char* p = der.data();
+    if (i2d_ECDSA_SIG(sig, &p) != der_len) { ECDSA_SIG_free(sig); throw std::runtime_error("i2d_ECDSA_SIG write failed"); }
+
+    ECDSA_SIG_free(sig);
+    der.push_back(0x01); // SIGHASH_ALL
+    return der;
+}
+
+static bool parse_der_sig_drop_hashtype(const Bytes& sig_with_hashtype,
+                                       Bytes& der_sig,
+                                       uint8_t& sighash,
+                                       std::string& err) {
+    if (sig_with_hashtype.size() < 9) { err = "sig_too_short"; return false; }
+    der_sig.assign(sig_with_hashtype.begin(), sig_with_hashtype.end() - 1);
+    sighash = sig_with_hashtype.back();
+    if (der_sig.size() > consensus::MAX_WIT_ITEM_BYTES) { err = "sig_too_large"; return false; }
+    return true;
+}
+
+static bool verify_secp256k1_ecdsa_lows(const Bytes& pubkey_sec,
+                                       const Bytes& der_sig,
+                                       const Hash32& msg32,
+                                       std::string& err) {
+    err.clear();
+
+    EC_KEY* key = EC_KEY_new_by_curve_name(NID_secp256k1);
+    if (!key) { err = "ec_key_new_failed"; return false; }
+
+    const unsigned char* p = pubkey_sec.data();
+    if (!o2i_ECPublicKey(&key, &p, (long)pubkey_sec.size())) {
+        EC_KEY_free(key);
+        err = "bad_pubkey";
+        return false;
+    }
+
+    const unsigned char* sp = der_sig.data();
+    ECDSA_SIG* sig = d2i_ECDSA_SIG(nullptr, &sp, (long)der_sig.size());
+    if (!sig) {
+        EC_KEY_free(key);
+        err = "bad_der_sig";
+        return false;
+    }
+
+    if (!ecdsa_sig_is_low_s(sig)) {
+        ECDSA_SIG_free(sig);
+        EC_KEY_free(key);
+        err = "high_s";
+        return false;
+    }
+
+    int ok = ECDSA_do_verify(msg32.data(), 32, sig, key);
+    ECDSA_SIG_free(sig);
+    EC_KEY_free(key);
+
+    if (ok != 1) { err = "ecdsa_verify_failed"; return false; }
+    return true;
+}
+
+// ============================================================
+// Parallel helper
+// ============================================================
+template <typename Fn>
+static bool parallel_for(size_t n, Fn&& fn) {
+    if (n == 0) return true;
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned threads = (unsigned)std::min<size_t>(n, hw);
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> ts;
+    ts.reserve(threads);
+
+    for (unsigned t = 0; t < threads; t++) {
+        ts.emplace_back([&, t]() {
+            for (size_t i = (size_t)t; i < n && !stop.load(std::memory_order_relaxed); i += threads) {
+                if (!fn(i)) stop.store(true, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& th : ts) th.join();
+    return !stop.load(std::memory_order_relaxed);
+}
+
+// ============================================================
+// Value conservation helpers
+// ============================================================
+static bool add_u64_checked(uint64_t& acc, uint64_t x) {
+    if (UINT64_MAX - acc < x) return false;
+    acc += x;
+    return true;
+}
+static bool sum_inputs_outputs(const Tx& tx, const UTXOSet& view,
+                              uint64_t& in_sum, uint64_t& out_sum,
+                              std::string& err) {
+    in_sum = 0; out_sum = 0;
+    for (const auto& in : tx.vin) {
+        const Coin* c = view.get_ptr(in.prevout);
+        if (!c) { err = "missing_utxo"; return false; }
+        if (!add_u64_checked(in_sum, c->value)) { err = "input_sum_overflow"; return false; }
+    }
+    for (const auto& o : tx.vout) {
+        if (!add_u64_checked(out_sum, o.value)) { err = "output_sum_overflow"; return false; }
+    }
+    err.clear();
+    return true;
+}
+
+// ============================================================
+// Sigcheck (BIP143 P2WPKH SIGHASH_ALL)
+// ============================================================
+static bool sigcheck_p2wpkh_sighashall_prehashed(const Tx& tx, size_t in_index,
+                                                const UTXOSet& view, const Hash32& hp,
+                                                const Hash32& hs, const Hash32& ho,
+                                                std::string& err) {
+    if (in_index >= tx.vin.size()) { err = "bad_in_index"; return false; }
+    const auto& in = tx.vin[in_index];
+
+    const Coin* prev = view.get_ptr(in.prevout);
+    if (!prev) { err = "missing_utxo"; return false; }
+
+    Hash20 prev_h160{};
+    if (!is_p2wpkh_scriptpubkey(prev->script_pubkey, prev_h160)) {
+        err = "prev_not_p2wpkh";
+        return false;
+    }
+
+    if (in.witness_sig.empty() || in.witness_pubkey.empty()) { err = "missing_witness"; return false; }
+    if (in.witness_sig.size() > consensus::MAX_WIT_ITEM_BYTES) { err = "sig_too_large"; return false; }
+    if (in.witness_pubkey.size() > consensus::MAX_WIT_ITEM_BYTES) { err = "pubkey_too_large"; return false; }
+
+    if (in.witness_pubkey.size() != 33 || (in.witness_pubkey[0] != 0x02 && in.witness_pubkey[0] != 0x03)) {
+        err = "non_compressed_pubkey";
+        return false;
+    }
+
+    Hash20 pk_h160 = hash160(in.witness_pubkey);
+    if (pk_h160 != prev_h160) { err = "pubkey_hash_mismatch"; return false; }
+
+    Bytes der;
+    uint8_t sighash_byte = 0;
+    if (!parse_der_sig_drop_hashtype(in.witness_sig, der, sighash_byte, err)) return false;
+    if (sighash_byte != 0x01) { err = "unsupported_sighash"; return false; }
+
+    const Hash32 digest = bip143_sighash_all_p2wpkh_prehashed(
+        tx, in_index, *prev, pk_h160, hp, hs, ho, 1
+    );
+
+    return verify_secp256k1_ecdsa_lows(in.witness_pubkey, der, digest, err);
+}
+
+// ============================================================
+// Fee computation (note: watchtower fee schedule anchoring comes in (4))
+// ============================================================
+static uint64_t sum_transferred_ex_fee(const Tx& tx) {
+    uint64_t s = 0;
+    for (size_t i = 1; i < tx.vout.size(); i++) s += tx.vout[i].value;
+    return s;
+}
+static uint64_t compute_fee(const Tx& tx, const std::optional<FeeSnapshot>& snap) {
+    const uint64_t transferred = sum_transferred_ex_fee(tx);
+    const uint64_t bps_fee = fee_from_bps_tenths(transferred, consensus::TX_VALUE_BPS_TENTHS);
+
+    uint64_t gold_floor = 0;
+    if (snap && snap->gold_1oz_price_sats > 0) {
+        gold_floor = fee_from_bps_tenths(snap->gold_1oz_price_sats, consensus::GOLD_FLOOR_BPS_TENTHS);
+    }
+    return (gold_floor > bps_fee) ? gold_floor : bps_fee;
+}
+
+// ============================================================
+// Tx validation (normal + payout rules)
+// ============================================================
+static bool validate_normal_tx(const Tx& tx,
+                              const UTXOSet& view,
+                              const std::optional<FeeSnapshot>& snap,
+                              bool parallel_sigs,
+                              std::string& err) {
+    if (tx.vin.empty()) { err = "empty_vin"; return false; }
+    if (tx.vin.size() > consensus::MAX_INPUTS) { err = "too_many_inputs"; return false; }
+    if (tx.vout.size() < 2) { err = "missing_transfer_output"; return false; }
+    if (tx.vout.size() > consensus::MAX_OUTPUTS) { err = "too_many_outputs"; return false; }
+
+    if (!is_fee_sink_spk(tx.vout[0].script_pubkey)) { err = "bad_fee_sink"; return false; }
+    for (size_t i = 1; i < tx.vout.size(); i++) {
+        if (!is_p2wpkh_spk(tx.vout[i].script_pubkey)) { err = "non_p2wpkh_output"; return false; }
+    }
+
+    // Duplicate inputs
+    {
+        std::vector<OutPoint> ops;
+        ops.reserve(tx.vin.size());
+        for (const auto& in : tx.vin) ops.push_back(in.prevout);
+        std::sort(ops.begin(), ops.end());
+        for (size_t i = 1; i < ops.size(); i++) {
+            if (ops[i] == ops[i-1]) { err = "duplicate_input"; return false; }
+        }
+    }
+
+    // Inputs exist; forbid spending fee sink in normal tx
+    for (const auto& in : tx.vin) {
+        const Coin* pc = view.get_ptr(in.prevout);
+        if (!pc) { err = "missing_utxo"; return false; }
+        if (is_fee_sink_spk(pc->script_pubkey)) { err = "spend_fee_sink_forbidden"; return false; }
+    }
+
+    // Value conservation
+    uint64_t in_sum=0, out_sum=0;
+    {
+        std::string se;
+        if (!sum_inputs_outputs(tx, view, in_sum, out_sum, se)) { err = se; return false; }
+        if (in_sum < out_sum) { err = "insufficient_input_value"; return false; }
+    }
+
+    // Fee rule (enabled when snap known)
+    const uint64_t need_fee = compute_fee(tx, snap);
+    if (tx.vout[0].value < need_fee) { err = "fee_too_low"; return false; }
+    if (tx.vout[0].value > in_sum) { err = "fee_exceeds_inputs"; return false; }
+
+    const Hash32 hp = hashPrevouts(tx);
+    const Hash32 hs = hashSequence(tx);
+    const Hash32 ho = hashOutputs(tx);
+
+    if (!parallel_sigs) {
+        for (size_t i = 0; i < tx.vin.size(); i++) {
+            std::string e;
+            if (!sigcheck_p2wpkh_sighashall_prehashed(tx, i, view, hp, hs, ho, e)) {
+                err = "vin[" + std::to_string(i) + "]:" + (e.empty() ? "sigcheck_failed" : e);
+                return false;
+            }
+        }
+        err.clear();
+        return true;
+    }
+
+    std::vector<std::string> errs(tx.vin.size());
+    bool ok = parallel_for(tx.vin.size(), [&](size_t i)->bool {
+        std::string e;
+        if (!sigcheck_p2wpkh_sighashall_prehashed(tx, i, view, hp, hs, ho, e)) {
+            errs[i] = e.empty() ? "sigcheck_failed" : e;
+            return false;
+        }
+        return true;
+    });
+
+    if (!ok) {
+        for (size_t i = 0; i < errs.size(); i++) {
+            if (!errs[i].empty()) { err = "vin[" + std::to_string(i) + "]:" + errs[i]; return false; }
+        }
+        err = "sigcheck_failed";
+        return false;
+    }
+
+    err.clear();
+    return true;
+}
+
+struct Block {
+    uint32_t height{0};
+    Hash20 fee_recipient_pkh{};
+    std::vector<Tx> txs;
+};
+
+struct Hash32Eq { bool operator()(const Hash32& a, const Hash32& b) const noexcept { return hash32_eq(a,b); } };
+struct Hash32Hasher {
+    size_t operator()(const Hash32& h) const noexcept {
+        if constexpr (sizeof(size_t) == 8) {
+            uint64_t x=0,y=0;
+            std::memcpy(&x, h.data(), 8);
+            std::memcpy(&y, h.data()+8, 8);
+            return (size_t)(x ^ (y * 0x9E3779B97F4A7C15ULL));
+        } else {
+            uint32_t x=0,y=0;
+            std::memcpy(&x, h.data(), 4);
+            std::memcpy(&y, h.data()+4, 4);
+            return (size_t)(x ^ (y * 0x9E3779B9U));
+        }
+    }
+};
+
+static bool build_topo_levels(const Block& b,
+                              std::vector<std::vector<size_t>>& levels,
+                              std::vector<size_t>& level_of,
+                              std::string& err) {
+    const size_t n = b.txs.size();
+    levels.clear();
+    level_of.assign(n, (size_t)-1);
+    err.clear();
+    if (n == 0) return true;
+
+    std::unordered_map<Hash32, size_t, Hash32Hasher, Hash32Eq> txid_to_index;
+    txid_to_index.reserve(n * 2);
+
+    for (size_t i = 0; i < n; i++) {
+        const auto& txid = b.txs[i].txid;
+        if (txid_to_index.find(txid) != txid_to_index.end()) {
+            err = "duplicate_txid_in_block";
+            return false;
+        }
+        txid_to_index.emplace(txid, i);
+    }
+
+    std::vector<std::vector<size_t>> adj(n);
+    std::vector<size_t> indeg(n, 0);
+
+    for (size_t i = 0; i < n; i++) {
+        const auto& tx = b.txs[i];
+        for (const auto& in : tx.vin) {
+            auto it = txid_to_index.find(in.prevout.txid);
+            if (it == txid_to_index.end()) continue;
+            const size_t prod = it->second;
+            adj[prod].push_back(i);
+            indeg[i]++;
+        }
+    }
+
+    std::queue<size_t> q;
+    for (size_t i = 0; i < n; i++) if (indeg[i] == 0) q.push(i);
+
+    size_t produced = 0;
+    size_t lvl_idx = 0;
+
+    while (!q.empty()) {
+        const size_t level_sz = q.size();
+        std::vector<size_t> lvl;
+        lvl.reserve(level_sz);
+        for (size_t k = 0; k < level_sz; k++) { size_t u = q.front(); q.pop(); lvl.push_back(u); }
+        std::sort(lvl.begin(), lvl.end());
+
+        for (size_t u : lvl) {
+            level_of[u] = lvl_idx;
+            produced++;
+            for (size_t v : adj[u]) {
+                if (indeg[v] == 0) { err = "bad_indegree_state"; return false; }
+                indeg[v]--;
+            }
+        }
+        for (size_t u : lvl) {
+            for (size_t v : adj[u]) if (indeg[v] == 0) q.push(v);
+        }
+
+        levels.push_back(std::move(lvl));
+        lvl_idx++;
+    }
+
+    if (produced != n) { err = "cyclic_dependency_in_block"; return false; }
+    return true;
+}
+
+static bool level_has_double_spends(const Block& b,
+                                    const std::vector<size_t>& level,
+                                    std::string& err) {
+    std::vector<OutPoint> spent;
+    for (size_t idx : level) for (const auto& in : b.txs[idx].vin) spent.push_back(in.prevout);
+    std::sort(spent.begin(), spent.end());
+    for (size_t i = 1; i < spent.size(); i++) {
+        if (spent[i] == spent[i-1]) { err = "double_spend_within_level"; return true; }
+    }
+    err.clear();
+    return false;
+}
+
+static bool enforce_payout_is_last_level_only_tx(const std::vector<std::vector<size_t>>& levels,
+                                                const std::vector<size_t>& level_of,
+                                                size_t payout_index,
+                                                std::string& err) {
+    if (levels.empty()) { err = "no_levels"; return false; }
+    const size_t last_level = levels.size() - 1;
+    if (payout_index >= level_of.size() || level_of[payout_index] == (size_t)-1) { err = "payout_not_in_levels"; return false; }
+    if (level_of[payout_index] != last_level) { err = "payout_not_in_last_level"; return false; }
+    if (levels[last_level].size() != 1 || levels[last_level][0] != payout_index) { err = "payout_not_only_tx_in_last_level"; return false; }
+    err.clear();
+    return true;
+}
+
+static bool validate_payout_tx(const Block& b,
+                              const Tx& payout,
+                              const std::vector<OutPoint>& expected_fee_outpoints_sorted,
+                              const UTXOSet& view,
+                              std::string& err) {
+    for (const auto& o : payout.vout) {
+        if (!(is_p2wpkh_spk(o.script_pubkey) || is_fee_sink_spk(o.script_pubkey))) {
+            err = "payout_bad_output_script";
+            return false;
+        }
+    }
+
+    std::vector<OutPoint> got;
+    got.reserve(payout.vin.size());
+    for (const auto& in : payout.vin) got.push_back(in.prevout);
+    std::sort(got.begin(), got.end());
+    if (got != expected_fee_outpoints_sorted) { err = "payout_inputs_mismatch"; return false; }
+
+    uint64_t total_collected = 0;
+    for (const auto& op : expected_fee_outpoints_sorted) {
+        const Coin* c = view.get_ptr(op);
+        if (!c) { err = "payout_missing_fee_utxo"; return false; }
+        if (!is_fee_sink_spk(c->script_pubkey)) { err = "payout_spent_non_fee_sink"; return false; }
+        if (!add_u64_checked(total_collected, c->value)) { err = "payout_sum_overflow"; return false; }
+    }
+
+    if (payout.vout.empty() || payout.vout.size() > 2) { err = "payout_bad_vout_count"; return false; }
+
+    Bytes recip_spk = p2wpkh_spk_from_h160(b.fee_recipient_pkh);
+    if (payout.vout[0].script_pubkey != recip_spk) { err = "payout_bad_recipient_spk"; return false; }
+    if (payout.vout[0].value == 0) { err = "payout_zero_recipient"; return false; }
+    if (payout.vout[0].value > total_collected) { err = "payout_overpay"; return false; }
+
+    uint64_t out_sum = 0;
+    for (const auto& o : payout.vout) if (!add_u64_checked(out_sum, o.value)) { err = "payout_out_overflow"; return false; }
+
+    if (payout.vout.size() == 2) {
+        if (!is_fee_sink_spk(payout.vout[1].script_pubkey)) { err = "payout_bad_rollover_spk"; return false; }
+    }
+
+    if (out_sum > total_collected) { err = "payout_overpay"; return false; }
+    if (out_sum < total_collected) {
+        if (payout.vout.size() != 2) { err = "payout_missing_rollover"; return false; }
+        const uint64_t remainder = total_collected - payout.vout[0].value;
+        if (payout.vout[1].value != remainder) { err = "payout_bad_rollover_value"; return false; }
+    }
+    err.clear();
+    return true;
+}
+
+// ============================================================
+// SMT commitment of UTXO set: compact proof SMT
+// ============================================================
+static Hash32 smt_hash_node(const Hash32& L, const Hash32& R) {
+    Bytes b;
+    b.push_back('n'); b.push_back('|');
+    b.insert(b.end(), L.begin(), L.end());
+    b.push_back('|');
+    b.insert(b.end(), R.begin(), R.end());
+    return sha256_1(b);
+}
+static Hash32 smt_empty_leaf() {
+    Bytes b; b.push_back('l'); b.push_back('|'); b.push_back('E'); b.push_back('M'); b.push_back('P'); b.push_back('T'); b.push_back('Y');
+    return sha256_1(b);
+}
+static Hash32 hash_outpoint_key(const OutPoint& op) {
+    Bytes b;
+    b.insert(b.end(), op.txid.begin(), op.txid.end());
+    append_u32_le(b, op.vout);
+    return sha256_1(b);
+}
+static Hash32 hash_coin_value(const Coin& c) {
+    Bytes b;
+    b.push_back('c'); b.push_back('|');
+    append_u64_le(b, c.value);
+    b.push_back('|');
+    append_varint(b, c.script_pubkey.size());
+    append_bytes(b, c.script_pubkey);
+    return sha256_1(b);
+}
+static Hash32 smt_leaf_present(const Hash32& key_h, const Hash32& coin_h) {
+    Bytes b;
+    b.push_back('l'); b.push_back('|');
+    b.insert(b.end(), key_h.begin(), key_h.end());
+    b.push_back('|');
+    b.insert(b.end(), coin_h.begin(), coin_h.end());
+    return sha256_1(b);
+}
+static int get_bit(const Hash32& h, int bit_index_0_255) {
+    int byte_index = bit_index_0_255 / 8;
+    int bit_in_byte = 7 - (bit_index_0_255 % 8);
+    return (h[byte_index] >> bit_in_byte) & 1;
+}
+
+struct SMT {
+    std::map<std::string, Hash32> nodes;
+    std::array<Hash32, 257> default_hash{};
+
+    SMT() {
+        default_hash[256] = smt_empty_leaf();
+        for (int d = 255; d >= 0; --d) default_hash[d] = smt_hash_node(default_hash[d+1], default_hash[d+1]);
+        nodes["ROOT"] = default_hash[0];
+    }
+
+    Hash32 root() const {
+        auto it = nodes.find("ROOT");
+        return (it != nodes.end()) ? it->second : default_hash[0];
+    }
+
+    static std::string prefix_key(int depth, const Bytes& prefix_bits_packed) {
+        static const char* d = "0123456789abcdef";
+        std::string hex;
+        hex.reserve(prefix_bits_packed.size() * 2);
+        for (uint8_t x : prefix_bits_packed) {
+            hex.push_back(d[(x >> 4) & 0xF]);
+            hex.push_back(d[(x >> 0) & 0xF]);
+        }
+        return "d:" + std::to_string(depth) + ":" + hex;
+    }
+
+    static Bytes pack_prefix_bits(const Hash32& key_h, int depth_bits) {
+        int bytes = (depth_bits + 7) / 8;
+        Bytes out(bytes, 0);
+        for (int i = 0; i < depth_bits; i++) {
+            int bit = get_bit(key_h, i);
+            int bi = i / 8;
+            int bj = 7 - (i % 8);
+            out[bi] |= (uint8_t)(bit << bj);
+        }
+        return out;
+    }
+
+    void set_subroot_by_prefix(int depth, const Bytes& pref_packed, const Hash32& h) {
+        nodes[prefix_key(depth, pref_packed)] = h;
+    }
+    void set_root(const Hash32& r) { nodes["ROOT"] = r; }
+
+    struct KeyProofCompact {
+        OutPoint op{};
+        bool present_before{false};
+        Hash32 key_h{};
+        Hash32 coin_h_before{};
+        std::vector<std::pair<uint16_t, Hash32>> sib_nondefault; // (d, sibling_hash)
+
+        Hash32 sibling_at(int d, const std::array<Hash32,257>& defaults) const {
+            for (const auto& kv : sib_nondefault) if ((int)kv.first == d) return kv.second;
+            return defaults[d+1];
+        }
+    };
+
+    KeyProofCompact prove_one_compact(const OutPoint& op, bool present_before, const Hash32& coin_h_before) const {
+        KeyProofCompact p;
+        p.op = op;
+        p.present_before = present_before;
+        p.key_h = hash_outpoint_key(op);
+        p.coin_h_before = coin_h_before;
+
+        for (int d = 0; d < 256; d++) {
+            int prefix_len = d + 1;
+            Bytes pref = pack_prefix_bits(p.key_h, prefix_len);
+            int bit_in_prefix = prefix_len - 1;
+            int bi = bit_in_prefix / 8;
+            int bj = 7 - (bit_in_prefix % 8);
+            pref[bi] ^= (1u << bj);
+
+            auto it = nodes.find(prefix_key(prefix_len, pref));
+            Hash32 sib = (it != nodes.end()) ? it->second : default_hash[prefix_len];
+
+            if (!hash32_eq(sib, default_hash[prefix_len])) {
+                p.sib_nondefault.push_back({(uint16_t)d, sib});
+            }
+        }
+        return p;
+    }
+
+    static Hash32 compute_root_from_compact_proof(const KeyProofCompact& p,
+                                                 bool present,
+                                                 const Hash32& coin_h_value,
+                                                 const std::array<Hash32,257>& defaults) {
+        Hash32 leaf = present ? smt_leaf_present(p.key_h, coin_h_value) : defaults[256];
+        Hash32 h = leaf;
+
+        for (int d = 255; d >= 0; --d) {
+            int bit = get_bit(p.key_h, d);
+            Hash32 sib = p.sibling_at(d, defaults);
+            h = (bit == 0) ? smt_hash_node(h, sib) : smt_hash_node(sib, h);
+        }
+        return h;
+    }
+
+    void apply_one_update_compact(const KeyProofCompact& p,
+                                  bool present_after,
+                                  const Hash32& coin_h_after,
+                                  const Hash32& new_root) {
+        Hash32 h = present_after ? smt_leaf_present(p.key_h, coin_h_after) : default_hash[256];
+
+        Bytes pref256 = pack_prefix_bits(p.key_h, 256);
+        set_subroot_by_prefix(256, pref256, h);
+
+        for (int d = 255; d >= 0; --d) {
+            int bit = get_bit(p.key_h, d);
+            Hash32 sib = p.sibling_at(d, default_hash);
+            Hash32 parent = (bit == 0) ? smt_hash_node(h, sib) : smt_hash_node(sib, h);
+
+            Bytes pref = pack_prefix_bits(p.key_h, d);
+            set_subroot_by_prefix(d, pref, parent);
+            h = parent;
+        }
+        set_root(new_root);
+        (void)new_root;
+    }
+};
+
+// ============================================================
+// Merkle trace_root + proofs
+// ============================================================
+static Hash32 merkle_parent(const Hash32& a, const Hash32& b) {
+    Bytes x;
+    x.push_back('m'); x.push_back('|');
+    x.insert(x.end(), a.begin(), a.end());
+    x.push_back('|');
+    x.insert(x.end(), b.begin(), b.end());
+    return sha256_1(x);
+}
+static Hash32 merkle_root(std::vector<Hash32> leaves) {
+    if (leaves.empty()) {
+        Bytes b; b.push_back('m'); b.push_back('|'); b.push_back('E'); b.push_back('M'); b.push_back('P'); b.push_back('T'); b.push_back('Y');
+        return sha256_1(b);
+    }
+    while (leaves.size() > 1) {
+        std::vector<Hash32> nxt;
+        nxt.reserve((leaves.size() + 1) / 2);
+        for (size_t i = 0; i < leaves.size(); i += 2) {
+            if (i + 1 < leaves.size()) nxt.push_back(merkle_parent(leaves[i], leaves[i + 1]));
+            else nxt.push_back(merkle_parent(leaves[i], leaves[i]));
+        }
+        leaves.swap(nxt);
+    }
+    return leaves[0];
+}
+struct MerklePathNode { Hash32 sibling{}; bool sibling_is_left{false}; };
+static std::vector<MerklePathNode> merkle_proof(const std::vector<Hash32>& leaf_hashes, size_t index) {
+    if (leaf_hashes.empty()) return {};
+    std::vector<Hash32> layer = leaf_hashes;
+    size_t idx = index;
+    std::vector<MerklePathNode> path;
+
+    while (layer.size() > 1) {
+        bool is_right = (idx % 2 == 1);
+        size_t sib = is_right ? (idx - 1) : (idx + 1);
+        Hash32 sib_hash = (sib < layer.size()) ? layer[sib] : layer[idx];
+        path.push_back(MerklePathNode{sib_hash, is_right});
+
+        std::vector<Hash32> nxt;
+        nxt.reserve((layer.size() + 1) / 2);
+        for (size_t i = 0; i < layer.size(); i += 2) {
+            if (i + 1 < layer.size()) nxt.push_back(merkle_parent(layer[i], layer[i + 1]));
+            else nxt.push_back(merkle_parent(layer[i], layer[i]));
+        }
+        layer.swap(nxt);
+        idx /= 2;
+    }
+    return path;
+}
+static bool merkle_verify_leaf_hash32(const Hash32& leaf,
+                                     const std::vector<MerklePathNode>& path,
+                                     const Hash32& expected_root) {
+    Hash32 h = leaf;
+    for (const auto& p : path) {
+        h = p.sibling_is_left ? merkle_parent(p.sibling, h)
+                              : merkle_parent(h, p.sibling);
+    }
+    return hash32_eq(h, expected_root);
+}
+
+// ============================================================
+// Trace entries with SMT steps (fraud-proof material)
+// ============================================================
+struct SMTStep {
+    Hash32 root_before{};
+    SMT::KeyProofCompact proof{};
+    bool present_after{false};
+    Hash32 coin_h_after{};
+    Hash32 root_after{};
+};
+
+struct TraceEntry {
+    Hash32 pre_state_root{};
+    Hash32 txid{};
+    std::vector<SMTStep> steps;
+    Hash32 post_state_root{};
+
+    Hash32 leaf_hash(const std::array<Hash32,257>& defaults) const {
+        Bytes b;
+        b.push_back('t'); b.push_back('|');
+        b.insert(b.end(), pre_state_root.begin(), pre_state_root.end());
+        b.push_back('|');
+        b.insert(b.end(), txid.begin(), txid.end());
+        b.push_back('|');
+
+        append_varint(b, steps.size());
+        for (const auto& st : steps) {
+            b.insert(b.end(), st.root_before.begin(), st.root_before.end());
+
+            b.push_back(st.proof.present_before ? 1 : 0);
+            b.insert(b.end(), st.proof.key_h.begin(), st.proof.key_h.end());
+            b.insert(b.end(), st.proof.coin_h_before.begin(), st.proof.coin_h_before.end());
+
+            b.push_back(st.present_after ? 1 : 0);
+            b.insert(b.end(), st.coin_h_after.begin(), st.coin_h_after.end());
+
+            b.insert(b.end(), st.root_after.begin(), st.root_after.end());
+
+            append_varint(b, st.proof.sib_nondefault.size());
+            for (const auto& kv : st.proof.sib_nondefault) {
+                append_u32_le(b, kv.first);
+                b.insert(b.end(), kv.second.begin(), kv.second.end());
+            }
+        }
+
+        b.push_back('|');
+        b.insert(b.end(), post_state_root.begin(), post_state_root.end());
+        (void)defaults;
+        return sha256_1(b);
+    }
+};
+
+// ============================================================
+// Header hashing + PoW (demo)
+// ============================================================
+static std::string sha256_hex_str(const std::string& s) {
+    unsigned char d[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), d);
+    static const char* hexd="0123456789abcdef";
+    std::string out; out.resize(64);
+    for (int i=0;i<32;i++){ out[2*i]=hexd[(d[i]>>4)&0xF]; out[2*i+1]=hexd[d[i]&0xF]; }
+    return out;
+}
+static bool has_leading_hex_zeros(const std::string& hexhash, size_t zeros) {
+    for (size_t i = 0; i < zeros; ++i) if (i >= hexhash.size() || hexhash[i] != '0') return false;
+    return true;
+}
+
+struct BlockHeaderLite {
+    uint64_t height{0};
+    std::string prev_hash;
+    std::string state_root_hex;
+    std::string trace_root_hex;
+    uint64_t nonce{0};
+    std::string block_hash;
+};
+
+static std::string compute_block_hash(const BlockHeaderLite& h) {
+    return sha256_hex_str("blk|" + h.prev_hash + "|" + h.state_root_hex + "|" + h.trace_root_hex + "|" + std::to_string(h.nonce));
+}
+static bool verify_pow(const BlockHeaderLite& h) {
+    std::string cand = sha256_hex_str("pow|" + std::to_string(h.height) + "|" + h.prev_hash + "|" + std::to_string(h.nonce));
+    return has_leading_hex_zeros(cand, (size_t)POW_DIFFICULTY_ZEROS);
+}
+
+// ============================================================
+// Fork-choice: cumulative work + deterministic tie-break
+// ============================================================
+struct ForkChoiceDAG {
+    struct NodeInfo {
+        BlockHeaderLite hdr;
+        uint64_t work{0};
+        uint64_t cum_work{0};
+        std::string parent;
+    };
+
+    std::map<std::string, NodeInfo> nodes;
+    std::string best_tip_hash;
+
+    static uint64_t per_block_work() {
+        uint64_t w = 1;
+        for (uint64_t i=0;i<POW_DIFFICULTY_ZEROS && i<15;i++) w *= 16;
+        return w;
+    }
+
+    void add_header(const BlockHeaderLite& hdr) {
+        NodeInfo ni;
+        ni.hdr = hdr;
+        ni.work = per_block_work();
+        ni.parent = hdr.prev_hash;
+
+        uint64_t parent_cw = 0;
+        auto itp = nodes.find(hdr.prev_hash);
+        if (hdr.height != 0 && itp != nodes.end()) parent_cw = itp->second.cum_work;
+        ni.cum_work = parent_cw + ni.work;
+
+        nodes[hdr.block_hash] = ni;
+
+        if (best_tip_hash.empty()) best_tip_hash = hdr.block_hash;
+        else {
+            const auto& best = nodes[best_tip_hash];
+            const auto& cur  = nodes[hdr.block_hash];
+            if (cur.cum_work > best.cum_work) best_tip_hash = hdr.block_hash;
+            else if (cur.cum_work == best.cum_work) {
+                if (cur.hdr.block_hash < best.hdr.block_hash) best_tip_hash = hdr.block_hash;
+            }
+        }
+    }
+
+    const BlockHeaderLite* best_tip() const {
+        auto it = nodes.find(best_tip_hash);
+        if (it == nodes.end()) return nullptr;
+        return &it->second.hdr;
+    }
+};
+
+// ============================================================
+// Shard block + stored metadata
+// ============================================================
+struct ShardBlock {
+    BlockHeaderLite hdr;
+    std::vector<Tx> txs;
+    std::vector<TraceEntry> trace;
+};
+
+struct StateSnapshot { UTXOSet utxo; SMT smt; };
+
+struct StoredBlock {
+    ShardBlock blk;
+    std::vector<std::vector<Undo>> utxo_undo_per_tx;
+    bool has_checkpoint{false};
+    StateSnapshot checkpoint_after;
+};
+
+// ============================================================
+// Orphan pool
+// ============================================================
+struct OrphanPool {
+    std::map<std::string, std::vector<std::string>> by_parent;
+    std::map<std::string, ShardBlock> blocks;
+
+    void add(const ShardBlock& b) {
+        blocks[b.hdr.block_hash] = b;
+        by_parent[b.hdr.prev_hash].push_back(b.hdr.block_hash);
+    }
+
+    std::vector<ShardBlock> take_children_of(const std::string& parent_hash) {
+        std::vector<ShardBlock> out;
+        auto it = by_parent.find(parent_hash);
+        if (it == by_parent.end()) return out;
+
+        for (const auto& h : it->second) {
+            auto ib = blocks.find(h);
+            if (ib != blocks.end()) out.push_back(ib->second);
+        }
+
+        for (const auto& h : it->second) blocks.erase(h);
+        by_parent.erase(it);
+        return out;
+    }
+
+    size_t size() const { return blocks.size(); }
+};
+
+// ============================================================
+// Shard chain with forks + checkpoints/undo + orphan pool
+// ============================================================
+class ShardChainForkedC {
+public:
+    explicit ShardChainForkedC(uint64_t shard_id) : shard_id_(shard_id) {
+        ShardBlock genesis;
+        genesis.hdr.height = 0;
+        genesis.hdr.prev_hash = "GENESIS";
+        genesis.hdr.state_root_hex = hex_of(genesis_state_.smt.root());
+        genesis.hdr.trace_root_hex = hex_of(merkle_root({}));
+        genesis.hdr.nonce = 0;
+        genesis.hdr.block_hash = compute_block_hash(genesis.hdr);
+
+        StoredBlock sb;
+        sb.blk = genesis;
+        sb.has_checkpoint = true;
+        sb.checkpoint_after = genesis_state_;
+
+        blocks_[genesis.hdr.block_hash] = std::move(sb);
+        fc_.add_header(genesis.hdr);
+        best_tip_hash_ = genesis.hdr.block_hash;
+    }
+
+    uint64_t shard_id() const { return shard_id_; }
+
+    const BlockHeaderLite* best_tip_header() const { return fc_.best_tip(); }
+
+    const std::array<Hash32,257>& smt_defaults() const { return genesis_state_.smt.default_hash; }
+
+    // DEMO only: seed a coin to a P2WPKH output in genesis state
+    void seed_utxo(const OutPoint& op, const Coin& c) {
+        std::lock_guard<std::mutex> g(mtx_);
+
+        std::vector<Undo> undo;
+        std::string err;
+
+        Tx t;
+        t.txid = op.txid;
+        t.vin = {};
+        t.vout.resize(op.vout + 1);
+        t.vout[op.vout] = TxOut{c.value, c.script_pubkey};
+
+        if (!genesis_state_.utxo.apply_tx(t, undo, err)) throw std::runtime_error("seed_utxo apply_tx:" + err);
+
+        Hash32 coin_h = hash_coin_value(c);
+        auto proof = genesis_state_.smt.prove_one_compact(op, false, Hash32{});
+        Hash32 new_root = SMT::compute_root_from_compact_proof(proof, true, coin_h, genesis_state_.smt.default_hash);
+        genesis_state_.smt.apply_one_update_compact(proof, true, coin_h, new_root);
+
+        // reset storage for demo simplicity
+        blocks_.clear();
+        fc_ = ForkChoiceDAG{};
+        orphan_ = OrphanPool{};
+
+        ShardBlock genesis;
+        genesis.hdr.height = 0;
+        genesis.hdr.prev_hash = "GENESIS";
+        genesis.hdr.state_root_hex = hex_of(genesis_state_.smt.root());
+        genesis.hdr.trace_root_hex = hex_of(merkle_root({}));
+        genesis.hdr.nonce = 0;
+        genesis.hdr.block_hash = compute_block_hash(genesis.hdr);
+
+        StoredBlock sb;
+        sb.blk = genesis;
+        sb.has_checkpoint = true;
+        sb.checkpoint_after = genesis_state_;
+        blocks_[genesis.hdr.block_hash] = std::move(sb);
+
+        fc_.add_header(genesis.hdr);
+        best_tip_hash_ = genesis.hdr.block_hash;
+    }
+
+    // Mine on best tip, with optional demo corruption of first output SMT step
+    ShardBlock mine_on_best(Block b, const std::optional<FeeSnapshot>& snap, bool corrupt_demo=false) {
+        std::string parent;
+        {
+            std::lock_guard<std::mutex> g(mtx_);
+            parent = best_tip_hash_;
+        }
+
+        auto built = build_block_on_parent(parent, b, snap, corrupt_demo);
+        if (!built) throw std::runtime_error("mine failed");
+        std::string err;
+        import_block_candidate(*built, snap, err); // should succeed (self-mined)
+        return *built;
+    }
+
+    bool import_block_candidate(const ShardBlock& candidate,
+                                const std::optional<FeeSnapshot>& snap,
+                                std::string& err) {
+        std::lock_guard<std::mutex> g(mtx_);
+        err.clear();
+
+        if (blocks_.find(candidate.hdr.block_hash) != blocks_.end()) return true;
+
+        // Orphan acceptance policy: ONLY store if header hash + PoW valid.
+        if (compute_block_hash(candidate.hdr) != candidate.hdr.block_hash) { err="bad_block_hash"; return false; }
+        if (!verify_pow(candidate.hdr)) { err="bad_pow"; return false; }
+
+        if (blocks_.find(candidate.hdr.prev_hash) == blocks_.end()) {
+            orphan_.add(candidate);
+            err = "orphan_stored_unknown_parent";
+            return false;
+        }
+
+        auto rebuilt = validate_and_reexecute_on_parent(candidate, snap, err);
+        if (!rebuilt) return false;
+
+        store_block(*rebuilt);
+        fc_.add_header(rebuilt->blk.hdr);
+        if (const BlockHeaderLite* best = fc_.best_tip()) best_tip_hash_ = best->block_hash;
+
+        connect_orphans_recursive(rebuilt->blk.hdr.block_hash, snap);
+        return true;
+    }
+
+    std::vector<BlockHeaderLite> headers_bestchain_from_to(uint64_t from_h, uint64_t to_h) const {
+        std::lock_guard<std::mutex> g(mtx_);
+        if (from_h == 0) throw std::runtime_error("from_h must be >= 1");
+        if (from_h > to_h) throw std::runtime_error("bad range");
+
+        std::vector<BlockHeaderLite> out;
+        std::string cur = best_tip_hash_;
+
+        while (true) {
+            auto it = blocks_.find(cur);
+            if (it == blocks_.end()) throw std::runtime_error("best tip missing");
+            const auto& h = it->second.blk.hdr;
+
+            if (h.height < from_h) break;
+            if (h.height <= to_h) out.push_back(h);
+
+            if (h.height == 0) break;
+            cur = h.prev_hash;
+        }
+
+        std::reverse(out.begin(), out.end());
+        if (out.empty() || out.front().height != from_h || out.back().height != to_h)
+            throw std::runtime_error("range_not_on_best_chain");
+        return out;
+    }
+
+    std::optional<ShardBlock> get_block_by_height_bestchain(uint64_t height) const {
+        std::lock_guard<std::mutex> g(mtx_);
+        std::string cur = best_tip_hash_;
+        while (true) {
+            auto it = blocks_.find(cur);
+            if (it == blocks_.end()) return std::nullopt;
+            const auto& b = it->second.blk;
+            if (b.hdr.height == height) return b;
+            if (b.hdr.height < height) return std::nullopt;
+            if (b.hdr.height == 0) return std::nullopt;
+            cur = b.hdr.prev_hash;
+        }
+    }
+
+    size_t orphan_count() const {
+        std::lock_guard<std::mutex> g(mtx_);
+        return orphan_.size();
+    }
+
+private:
+    uint64_t shard_id_{0};
+    mutable std::mutex mtx_;
+
+    StateSnapshot genesis_state_{};
+
+    std::map<std::string, StoredBlock> blocks_;
+    ForkChoiceDAG fc_;
+    std::string best_tip_hash_;
+    OrphanPool orphan_;
+
+    // ---------- State reconstruction using checkpoints ----------
+    bool reconstruct_state_after(const std::string& block_hash, StateSnapshot& out, std::string& err) const {
+        auto it = blocks_.find(block_hash);
+        if (it == blocks_.end()) { err = "unknown_block"; return false; }
+
+        std::vector<std::string> path;
+        std::string cur = block_hash;
+
+        while (true) {
+            auto itc = blocks_.find(cur);
+            if (itc == blocks_.end()) { err = "missing_ancestor"; return false; }
+            if (itc->second.has_checkpoint) {
+                out = itc->second.checkpoint_after;
+                break;
+            }
+            path.push_back(cur);
+            cur = itc->second.blk.hdr.prev_hash;
+        }
+
+        std::reverse(path.begin(), path.end());
+        for (const auto& h : path) {
+            auto itb = blocks_.find(h);
+            if (itb == blocks_.end()) { err = "missing_path_block"; return false; }
+            if (!apply_stored_block_forward(itb->second, out, err)) return false;
+        }
+        err.clear();
+        return true;
+    }
+
+    static bool apply_stored_block_forward(const StoredBlock& sb, StateSnapshot& st, std::string& err) {
+        // UTXO: apply txs
+        for (size_t i = 0; i < sb.blk.txs.size(); i++) {
+            std::vector<Undo> undo;
+            if (!st.utxo.apply_tx(sb.blk.txs[i], undo, err)) return false;
+        }
+
+        // SMT: apply trace steps
+        Hash32 cur = st.smt.root();
+        for (const auto& te : sb.blk.trace) {
+            for (const auto& step : te.steps) {
+                if (!hash32_eq(step.root_before, cur)) { err = "smt_chain_broken_forward"; return false; }
+                Hash32 rb = SMT::compute_root_from_compact_proof(step.proof, step.proof.present_before, step.proof.coin_h_before, st.smt.default_hash);
+                if (!hash32_eq(rb, step.root_before)) { err = "smt_before_mismatch_forward"; return false; }
+
+                st.smt.apply_one_update_compact(step.proof, step.present_after, step.coin_h_after, step.root_after);
+                cur = step.root_after;
+            }
+        }
+        err.clear();
+        return true;
+    }
+
+    // ---------- Build/validate blocks on parent ----------
+    std::optional<ShardBlock> build_block_on_parent(const std::string& parent_hash,
+                                                    Block b,
+                                                    const std::optional<FeeSnapshot>& snap,
+                                                    bool corrupt_demo) {
+        if (blocks_.find(parent_hash) == blocks_.end()) return std::nullopt;
+
+        StateSnapshot parent_state;
+        std::string err;
+        if (!reconstruct_state_after(parent_hash, parent_state, err)) throw std::runtime_error("reconstruct parent failed:" + err);
+
+        for (auto& tx : b.txs) tx.txid = compute_txid(tx);
+
+        std::vector<std::vector<size_t>> levels;
+        std::vector<size_t> level_of;
+        if (!build_topo_levels(b, levels, level_of, err)) throw std::runtime_error("topo:" + err);
+
+        const size_t payout_index = b.txs.size() - 1;
+        if (!enforce_payout_is_last_level_only_tx(levels, level_of, payout_index, err))
+            throw std::runtime_error("payout_level:" + err);
+
+        std::vector<OutPoint> expected_fee_outpoints;
+        expected_fee_outpoints.reserve(payout_index);
+        for (size_t i = 0; i < payout_index; i++) expected_fee_outpoints.push_back(OutPoint{b.txs[i].txid, 0});
+        std::sort(expected_fee_outpoints.begin(), expected_fee_outpoints.end());
+
+        StateSnapshot working = parent_state;
+
+        ShardBlock blk;
+        blk.hdr.height = blocks_.at(parent_hash).blk.hdr.height + 1;
+        blk.hdr.prev_hash = parent_hash;
+
+        // PoW mining (demo)
+        uint64_t nonce = 0;
+        while (true) {
+            blk.hdr.nonce = nonce;
+            if (verify_pow(blk.hdr)) break;
+            nonce++;
+        }
+
+        blk.txs = b.txs;
+        blk.trace.clear();
+        blk.trace.reserve(b.txs.size());
+
+        for (size_t li = 0; li < levels.size(); li++) {
+            const auto& level = levels[li];
+            if (level_has_double_spends(b, level, err)) throw std::runtime_error("dblspend:" + err);
+
+            const UTXOSet view = working.utxo;
+
+            std::vector<std::string> tx_errs(level.size());
+            bool all_ok = parallel_for(level.size(), [&](size_t j)->bool {
+                const size_t txi = level[j];
+                std::string te;
+
+                if (txi == payout_index) {
+                    if (!validate_payout_tx(b, b.txs[txi], expected_fee_outpoints, view, te)) {
+                        tx_errs[j] = te.empty() ? "payout_invalid" : te;
+                        return false;
+                    }
+                    return true;
+                }
+
+                if (!validate_normal_tx(b.txs[txi], view, snap, /*parallel_sigs=*/false, te)) {
+                    tx_errs[j] = te.empty() ? "tx_invalid" : te;
+                    return false;
+                }
+                return true;
+            });
+
+            if (!all_ok) {
+                for (size_t j = 0; j < tx_errs.size(); j++) {
+                    if (!tx_errs[j].empty()) {
+                        throw std::runtime_error("level[" + std::to_string(li) + "].tx[" + std::to_string(level[j]) + "]:" + tx_errs[j]);
+                    }
+                }
+                throw std::runtime_error("tx_invalid");
+            }
+
+            // Apply sequentially + build trace
+            for (size_t txi : level) {
+                const Tx& tx = b.txs[txi];
+
+                TraceEntry te;
+                te.pre_state_root = working.smt.root();
+                te.txid = tx.txid;
+
+                Hash32 cur_root = working.smt.root();
+
+                // spends: present -> absent
+                for (const auto& in : tx.vin) {
+                    const Coin* pc = working.utxo.get_ptr(in.prevout);
+                    if (!pc) throw std::runtime_error("apply_missing_utxo");
+                    Hash32 coin_h_before = hash_coin_value(*pc);
+
+                    SMTStep st;
+                    st.root_before = cur_root;
+                    st.proof = working.smt.prove_one_compact(in.prevout, true, coin_h_before);
+                    st.present_after = false;
+                    st.coin_h_after = Hash32{};
+
+                    Hash32 rb = SMT::compute_root_from_compact_proof(st.proof, true, coin_h_before, working.smt.default_hash);
+                    if (!hash32_eq(rb, st.root_before)) throw std::runtime_error("smt_before_mismatch");
+
+                    Hash32 ra = SMT::compute_root_from_compact_proof(st.proof, false, Hash32{}, working.smt.default_hash);
+                    st.root_after = ra;
+
+                    te.steps.push_back(st);
+                    working.smt.apply_one_update_compact(st.proof, false, Hash32{}, st.root_after);
+                    cur_root = st.root_after;
+                }
+
+                // apply UTXO
+                std::vector<Undo> undo;
+                std::string aerr;
+                if (!working.utxo.apply_tx(tx, undo, aerr)) throw std::runtime_error("apply_tx:" + aerr);
+
+                // creates: absent -> present
+                for (uint32_t oi = 0; oi < (uint32_t)tx.vout.size(); oi++) {
+                    OutPoint op{tx.txid, oi};
+                    Coin c{tx.vout[oi].value, tx.vout[oi].script_pubkey};
+                    Hash32 coin_h = hash_coin_value(c);
+
+                    SMTStep st;
+                    st.root_before = cur_root;
+                    st.proof = working.smt.prove_one_compact(op, false, Hash32{});
+                    st.present_after = true;
+                    st.coin_h_after = coin_h;
+
+                    Hash32 rb = SMT::compute_root_from_compact_proof(st.proof, false, Hash32{}, working.smt.default_hash);
+                    if (!hash32_eq(rb, st.root_before)) throw std::runtime_error("smt_before_absent_mismatch");
+
+                    Hash32 ra = SMT::compute_root_from_compact_proof(st.proof, true, coin_h, working.smt.default_hash);
+                    st.root_after = ra;
+
+                    // demo corruption
+                    if (corrupt_demo && txi == 0 && oi == 0) {
+                        Hash32 bogus{}; bogus[0] = 0x42;
+                        st.root_after = bogus;
+                    }
+
+                    te.steps.push_back(st);
+                    working.smt.apply_one_update_compact(st.proof, true, coin_h, st.root_after);
+                    cur_root = st.root_after;
+                }
+
+                te.post_state_root = cur_root;
+                blk.trace.push_back(te);
+            }
+        }
+
+        // roots
+        blk.hdr.state_root_hex = hex_of(working.smt.root());
+        std::vector<Hash32> leaves;
+        leaves.reserve(blk.trace.size());
+        for (const auto& e : blk.trace) leaves.push_back(e.leaf_hash(working.smt.default_hash));
+        Hash32 tr = merkle_root(leaves);
+        blk.hdr.trace_root_hex = hex_of(tr);
+
+        blk.hdr.block_hash = compute_block_hash(blk.hdr);
+        return blk;
+    }
+
+    std::optional<StoredBlock> validate_and_reexecute_on_parent(const ShardBlock& candidate,
+                                                               const std::optional<FeeSnapshot>& snap,
+                                                               std::string& err) {
+        err.clear();
+
+        StateSnapshot parent_state;
+        if (!reconstruct_state_after(candidate.hdr.prev_hash, parent_state, err)) return std::nullopt;
+
+        if (candidate.txs.empty()) { err = "empty_block"; return std::nullopt; }
+
+        Block b;
+        b.height = (uint32_t)candidate.hdr.height;
+        {
+            Hash20 out{};
+            if (!is_p2wpkh_scriptpubkey(candidate.txs.back().vout[0].script_pubkey, out)) {
+                err = "payout_recipient_not_p2wpkh";
+                return std::nullopt;
+            }
+            b.fee_recipient_pkh = out;
+        }
+        b.txs = candidate.txs;
+        for (auto& tx : b.txs) tx.txid = compute_txid(tx);
+
+        std::vector<std::vector<size_t>> levels;
+        std::vector<size_t> level_of;
+        if (!build_topo_levels(b, levels, level_of, err)) return std::nullopt;
+
+        const size_t payout_index = b.txs.size() - 1;
+        if (!enforce_payout_is_last_level_only_tx(levels, level_of, payout_index, err)) return std::nullopt;
+
+        std::vector<OutPoint> expected_fee_outpoints;
+        expected_fee_outpoints.reserve(payout_index);
+        for (size_t i = 0; i < payout_index; i++) expected_fee_outpoints.push_back(OutPoint{b.txs[i].txid, 0});
+        std::sort(expected_fee_outpoints.begin(), expected_fee_outpoints.end());
+
+        StateSnapshot working = parent_state;
+
+        ShardBlock rebuilt;
+        rebuilt.hdr = candidate.hdr;
+        rebuilt.txs = b.txs;
+        rebuilt.trace.clear();
+        rebuilt.trace.reserve(b.txs.size());
+
+        std::vector<std::vector<Undo>> undo_per_tx;
+        undo_per_tx.resize(b.txs.size());
+
+        for (size_t li = 0; li < levels.size(); li++) {
+            const auto& level = levels[li];
+            if (level_has_double_spends(b, level, err)) return std::nullopt;
+
+            const UTXOSet view = working.utxo;
+
+            std::vector<std::string> tx_errs(level.size());
+            bool all_ok = parallel_for(level.size(), [&](size_t j)->bool {
+                const size_t txi = level[j];
+                std::string te;
+
+                if (txi == payout_index) {
+                    if (!validate_payout_tx(b, b.txs[txi], expected_fee_outpoints, view, te)) {
+                        tx_errs[j] = te.empty() ? "payout_invalid" : te;
+                        return false;
+                    }
+                    return true;
+                }
+
+                if (!validate_normal_tx(b.txs[txi], view, snap, /*parallel_sigs=*/false, te)) {
+                    tx_errs[j] = te.empty() ? "tx_invalid" : te;
+                    return false;
+                }
+                return true;
+            });
+
+            if (!all_ok) {
+                for (size_t j = 0; j < tx_errs.size(); j++) {
+                    if (!tx_errs[j].empty()) { err = tx_errs[j]; return std::nullopt; }
+                }
+                err = "tx_invalid";
+                return std::nullopt;
+            }
+
+            for (size_t txi : level) {
+                const Tx& tx = b.txs[txi];
+
+                TraceEntry te;
+                te.pre_state_root = working.smt.root();
+                te.txid = tx.txid;
+
+                Hash32 cur_root = working.smt.root();
+
+                for (const auto& in : tx.vin) {
+                    const Coin* pc = working.utxo.get_ptr(in.prevout);
+                    if (!pc) { err = "apply_missing_utxo"; return std::nullopt; }
+                    Hash32 coin_h_before = hash_coin_value(*pc);
+
+                    SMTStep st;
+                    st.root_before = cur_root;
+                    st.proof = working.smt.prove_one_compact(in.prevout, true, coin_h_before);
+                    st.present_after = false;
+                    st.coin_h_after = Hash32{};
+
+                    Hash32 rb = SMT::compute_root_from_compact_proof(st.proof, true, coin_h_before, working.smt.default_hash);
+                    if (!hash32_eq(rb, st.root_before)) { err = "smt_before_mismatch"; return std::nullopt; }
+
+                    Hash32 ra = SMT::compute_root_from_compact_proof(st.proof, false, Hash32{}, working.smt.default_hash);
+                    st.root_after = ra;
+
+                    te.steps.push_back(st);
+                    working.smt.apply_one_update_compact(st.proof, false, Hash32{}, st.root_after);
+                    cur_root = st.root_after;
+                }
+
+                std::string aerr;
+                if (!working.utxo.apply_tx(tx, undo_per_tx[txi], aerr)) { err = "apply_tx:" + aerr; return std::nullopt; }
+
+                for (uint32_t oi = 0; oi < (uint32_t)tx.vout.size(); oi++) {
+                    OutPoint op{tx.txid, oi};
+                    Coin c{tx.vout[oi].value, tx.vout[oi].script_pubkey};
+                    Hash32 coin_h = hash_coin_value(c);
+
+                    SMTStep st;
+                    st.root_before = cur_root;
+                    st.proof = working.smt.prove_one_compact(op, false, Hash32{});
+                    st.present_after = true;
+                    st.coin_h_after = coin_h;
+
+                    Hash32 rb = SMT::compute_root_from_compact_proof(st.proof, false, Hash32{}, working.smt.default_hash);
+                    if (!hash32_eq(rb, st.root_before)) { err = "smt_before_absent_mismatch"; return std::nullopt; }
+
+                    Hash32 ra = SMT::compute_root_from_compact_proof(st.proof, true, coin_h, working.smt.default_hash);
+                    st.root_after = ra;
+
+                    te.steps.push_back(st);
+                    working.smt.apply_one_update_compact(st.proof, true, coin_h, st.root_after);
+                    cur_root = st.root_after;
+                }
+
+                te.post_state_root = cur_root;
+                rebuilt.trace.push_back(te);
+            }
+        }
+
+        rebuilt.hdr.state_root_hex = hex_of(working.smt.root());
+        std::vector<Hash32> leaves;
+        leaves.reserve(rebuilt.trace.size());
+        for (const auto& e : rebuilt.trace) leaves.push_back(e.leaf_hash(working.smt.default_hash));
+        Hash32 tr = merkle_root(leaves);
+        rebuilt.hdr.trace_root_hex = hex_of(tr);
+
+        if (rebuilt.hdr.state_root_hex != candidate.hdr.state_root_hex) { err = "state_root_mismatch"; return std::nullopt; }
+        if (rebuilt.hdr.trace_root_hex != candidate.hdr.trace_root_hex) { err = "trace_root_mismatch"; return std::nullopt; }
+
+        StoredBlock sb;
+        sb.blk = rebuilt;
+        sb.utxo_undo_per_tx = std::move(undo_per_tx);
+
+        if (rebuilt.hdr.height == 0 || (rebuilt.hdr.height % CHECKPOINT_INTERVAL == 0)) {
+            sb.has_checkpoint = true;
+            sb.checkpoint_after = std::move(working);
+        } else sb.has_checkpoint = false;
+
+        err.clear();
+        return sb;
+    }
+
+    void store_block(const StoredBlock& sb) { blocks_[sb.blk.hdr.block_hash] = sb; }
+
+    void connect_orphans_recursive(const std::string& parent_hash, const std::optional<FeeSnapshot>& snap) {
+        std::vector<ShardBlock> kids = orphan_.take_children_of(parent_hash);
+        for (const auto& child : kids) {
+            std::string err;
+            if (blocks_.find(child.hdr.prev_hash) == blocks_.end()) { orphan_.add(child); continue; }
+            if (blocks_.find(child.hdr.block_hash) != blocks_.end()) continue;
+
+            if (compute_block_hash(child.hdr) != child.hdr.block_hash) continue;
+            if (!verify_pow(child.hdr)) continue;
+
+            auto rebuilt = validate_and_reexecute_on_parent(child, snap, err);
+            if (!rebuilt) continue;
+
+            store_block(*rebuilt);
+            fc_.add_header(rebuilt->blk.hdr);
+            if (const BlockHeaderLite* best = fc_.best_tip()) best_tip_hash_ = best->block_hash;
+            connect_orphans_recursive(rebuilt->blk.hdr.block_hash, snap);
+        }
+    }
+};
+
+// ============================================================
+// Provider interface (remote verifier)
+// ============================================================
+struct TraceReply {
+    bool ok{false};
+    std::string err;
+
+    BlockHeaderLite header;
+    TraceEntry entry;
+    std::vector<MerklePathNode> path_to_trace_root;
+
+    // REQUIRED for consensus re-exec
+    Tx tx;
+
+    // REQUIRED for payout validation
+    Hash20 fee_recipient_pkh{};
+
+    // REQUIRED to validate payout inputs
+    std::vector<Hash32> txids_in_order;
+};
+
+struct IShardDataProvider {
+    virtual ~IShardDataProvider() = default;
+    virtual std::vector<BlockHeaderLite> GetHeaders(uint64_t shard_id, uint64_t from_h, uint64_t to_h) = 0;
+    virtual TraceReply GetTrace(uint64_t shard_id, uint64_t height, uint64_t tx_index) = 0;
+    virtual std::vector<Hash32> GetBlockTxids(uint64_t shard_id, uint64_t height) = 0;
+};
+
+struct LocalProvider final : IShardDataProvider {
+    std::vector<ShardChainForkedC*> shards;
+
+    std::vector<BlockHeaderLite> GetHeaders(uint64_t shard_id, uint64_t from_h, uint64_t to_h) override {
+        if (shard_id >= shards.size()) return {};
+        return shards[shard_id]->headers_bestchain_from_to(from_h, to_h);
+    }
+
+    std::vector<Hash32> GetBlockTxids(uint64_t shard_id, uint64_t height) override {
+        if (shard_id >= shards.size()) return {};
+        auto blk_opt = shards[shard_id]->get_block_by_height_bestchain(height);
+        if (!blk_opt) return {};
+        const auto& blk = *blk_opt;
+        std::vector<Hash32> out;
+        out.reserve(blk.txs.size());
+        for (const auto& tx : blk.txs) out.push_back(tx.txid);
+        return out;
+    }
+
+    TraceReply GetTrace(uint64_t shard_id, uint64_t height, uint64_t tx_index) override {
+        TraceReply r;
+        if (shard_id >= shards.size()) { r.err="bad_shard"; return r; }
+
+        auto blk_opt = shards[shard_id]->get_block_by_height_bestchain(height);
+        if (!blk_opt) { r.err="no_block_at_height"; return r; }
+        const auto& blk = *blk_opt;
+
+        if (blk.txs.empty()) { r.err="empty_block"; return r; }
+        if (tx_index >= blk.trace.size() || tx_index >= blk.txs.size()) { r.err="bad_tx_index"; return r; }
+
+        r.ok = true;
+        r.header = blk.hdr;
+        r.entry = blk.trace[tx_index];
+        r.tx = blk.txs[tx_index];
+
+        // fee recipient from payout tx vout[0]
+        {
+            Hash20 out{};
+            const Tx& payout = blk.txs.back();
+            if (payout.vout.empty() || !is_p2wpkh_scriptpubkey(payout.vout[0].script_pubkey, out)) {
+                r.ok=false; r.err="payout_recipient_not_p2wpkh"; return r;
+            }
+            r.fee_recipient_pkh = out;
+        }
+
+        r.txids_in_order.reserve(blk.txs.size());
+        for (const auto& t : blk.txs) r.txids_in_order.push_back(t.txid);
+
+        std::vector<Hash32> leaves;
+        leaves.reserve(blk.trace.size());
+        for (const auto& e : blk.trace) leaves.push_back(e.leaf_hash(shards[shard_id]->smt_defaults()));
+        r.path_to_trace_root = merkle_proof(leaves, tx_index);
+
+        return r;
+    }
+};
+
+// ============================================================
+// Fraud proof (2): build + verify
+// ============================================================
+struct FraudProof {
+    uint64_t shard_id{0};
+    uint64_t disputed_height{0};
+    uint64_t tx_index{0};
+
+    std::vector<BlockHeaderLite> headers_to_tip;
+
+    TraceEntry entry;
+    std::vector<MerklePathNode> trace_leaf_path;
+
+    // Needed to compute expected update effects
+    Tx tx;
+
+    // Needed for payout validation
+    Hash20 fee_recipient_pkh{};
+    std::vector<Hash32> block_txids_in_order;
+};
+
+static bool verify_header_chain_pow_linkage(const std::vector<BlockHeaderLite>& headers) {
+    if (headers.empty()) return false;
+    for (size_t i = 0; i < headers.size(); ++i) {
+        const auto& h = headers[i];
+        if (compute_block_hash(h) != h.block_hash) return false;
+        if (!verify_pow(h)) return false;
+
+        if (i > 0) {
+            const auto& prev = headers[i - 1];
+            if (h.prev_hash != prev.block_hash) return false;
+            if (h.height != prev.height + 1) return false;
+        }
+    }
+    return true;
+}
+
+// Returns: true iff FRAUD PROVEN. If malformed, sets err and returns false.
+static bool recompute_and_check_fraud(
+    const Tx& tx,
+    bool is_payout_tx,
+    const Hash20& fee_recipient_pkh,
+    const std::vector<Hash32>& block_txids_in_order,
+    const TraceEntry& te,
+    const std::array<Hash32,257>& smt_defaults,
+    std::string& err
+) {
+    err.clear();
+
+    Hash32 recomputed_txid = compute_txid(tx);
+    if (!hash32_eq(recomputed_txid, te.txid)) { err = "txid_mismatch"; return false; }
+
+    const size_t expected_steps = tx.vin.size() + tx.vout.size();
+    if (te.steps.size() != expected_steps) { err = "bad_step_count"; return false; }
+
+    // Validate payout constraints if payout
+    if (is_payout_tx) {
+        if (tx.vout.empty() || tx.vout.size() > 2) { err = "payout_bad_vout_count"; return false; }
+        if (tx.vout[0].script_pubkey != p2wpkh_spk_from_h160(fee_recipient_pkh)) { err = "payout_bad_recipient"; return false; }
+        if (tx.vout[0].value == 0) { err = "payout_zero"; return false; }
+
+        if (block_txids_in_order.size() < 1) { err = "missing_block_txids"; return false; }
+        // must be last tx in block
+        // caller enforces is_payout_tx based on tx_index==last
+        std::vector<OutPoint> expected_ops;
+        for (size_t i = 0; i + 1 < block_txids_in_order.size(); ++i) expected_ops.push_back(OutPoint{block_txids_in_order[i], 0});
+        std::sort(expected_ops.begin(), expected_ops.end());
+
+        std::vector<OutPoint> got_ops;
+        for (const auto& in : tx.vin) got_ops.push_back(in.prevout);
+        std::sort(got_ops.begin(), got_ops.end());
+
+        if (got_ops != expected_ops) { err = "payout_inputs_mismatch"; return false; }
+    } else {
+        // Normal tx script restrictions
+        if (tx.vout.size() < 2) { err = "normal_missing_transfer"; return false; }
+        if (!is_fee_sink_spk(tx.vout[0].script_pubkey)) { err = "normal_bad_fee_sink_spk"; return false; }
+        for (size_t i = 1; i < tx.vout.size(); ++i) {
+            if (!is_p2wpkh_spk(tx.vout[i].script_pubkey)) { err = "normal_non_p2wpkh_output"; return false; }
+        }
+        // Note: fee amount check depends on fee snapshot; anchoring that is done in (4).
+    }
+
+    // Recompute step-by-step
+    Hash32 cur = te.pre_state_root;
+
+    // spends
+    for (size_t i = 0; i < tx.vin.size(); ++i) {
+        const auto& in = tx.vin[i];
+        const auto& st = te.steps[i];
+
+        if (!hash32_eq(st.root_before, cur)) { err = "step_chain_break_spend"; return false; }
+        if (!st.proof.present_before) { err = "spend_not_present_before"; return false; }
+
+        Hash32 want_key = hash_outpoint_key(in.prevout);
+        if (!hash32_eq(want_key, st.proof.key_h)) { err = "spend_key_mismatch"; return false; }
+
+        Hash32 rb = SMT::compute_root_from_compact_proof(st.proof, true, st.proof.coin_h_before, smt_defaults);
+        if (!hash32_eq(rb, st.root_before)) { err = "smt_before_mismatch_spend"; return false; }
+
+        Hash32 ra = SMT::compute_root_from_compact_proof(st.proof, false, Hash32{}, smt_defaults);
+        if (!hash32_eq(ra, st.root_after)) return true; // FRAUD proven
+
+        cur = st.root_after;
+    }
+
+    // creates
+    for (uint32_t oi = 0; oi < (uint32_t)tx.vout.size(); ++oi) {
+        const size_t idx = tx.vin.size() + oi;
+        const auto& st = te.steps[idx];
+
+        if (!hash32_eq(st.root_before, cur)) { err = "step_chain_break_create"; return false; }
+        if (st.proof.present_before) { err = "create_present_before"; return false; }
+
+        OutPoint op{tx.txid, oi};
+        Hash32 want_key = hash_outpoint_key(op);
+        if (!hash32_eq(want_key, st.proof.key_h)) { err = "create_key_mismatch"; return false; }
+
+        Hash32 rb = SMT::compute_root_from_compact_proof(st.proof, false, Hash32{}, smt_defaults);
+        if (!hash32_eq(rb, st.root_before)) { err = "smt_before_mismatch_create"; return false; }
+
+        Coin c{tx.vout[oi].value, tx.vout[oi].script_pubkey};
+        Hash32 coin_after_h = hash_coin_value(c);
+        Hash32 ra = SMT::compute_root_from_compact_proof(st.proof, true, coin_after_h, smt_defaults);
+
+        if (!hash32_eq(ra, st.root_after)) return true; // FRAUD proven
+        cur = st.root_after;
+    }
+
+    if (!hash32_eq(cur, te.post_state_root)) return true; // FRAUD proven
+    return false; // no fraud proven
+}
+
+static bool verify_fraud_proof_utxo_smt(
+    const FraudProof& fp,
+    const std::array<Hash32,257>& smt_defaults,
+    std::string& err,
+    bool& out_fraud_proven
+) {
+    out_fraud_proven = false;
+    err.clear();
+
+    if (!verify_header_chain_pow_linkage(fp.headers_to_tip)) { err = "bad_header_chain"; return false; }
+
+    // disputed header is first
+    const auto& disputed_hdr = fp.headers_to_tip.front();
+
+    // verify trace inclusion
+    Hash32 expected_trace_root{};
+    if (!hash32_from_hex(disputed_hdr.trace_root_hex, expected_trace_root)) { err = "bad_trace_root_hex"; return false; }
+
+    Hash32 leaf = fp.entry.leaf_hash(smt_defaults);
+    if (!merkle_verify_leaf_hash32(leaf, fp.trace_leaf_path, expected_trace_root)) {
+        err = "trace_inclusion_failed";
+        return false;
+    }
+
+    if (fp.block_txids_in_order.empty()) { err = "missing_block_txids"; return false; }
+    if (fp.tx_index >= fp.block_txids_in_order.size()) { err = "tx_index_oob"; return false; }
+
+    const bool is_payout = (fp.tx_index + 1 == fp.block_txids_in_order.size());
+
+    std::string re_err;
+    bool fraud = recompute_and_check_fraud(
+        fp.tx, is_payout, fp.fee_recipient_pkh, fp.block_txids_in_order,
+        fp.entry, smt_defaults, re_err
+    );
+    if (!re_err.empty()) { err = "reexec_failed:" + re_err; return false; }
+
+    out_fraud_proven = fraud;
+    err = fraud ? "fraud_proven" : "no_fraud";
+    return true;
+}
+
+// Remote builder: in (4) this will request headers up to anchored tip; here we just fetch disputed header only.
+static std::optional<FraudProof> remote_build_fraud_proof_utxo_smt(
+    IShardDataProvider& prov,
+    uint64_t shard_id,
+    uint64_t disputed_height,
+    uint64_t tx_index
+) {
+    auto hdrs = prov.GetHeaders(shard_id, disputed_height, disputed_height);
+    if (hdrs.empty()) return std::nullopt;
+
+    auto tr = prov.GetTrace(shard_id, disputed_height, tx_index);
+    if (!tr.ok) return std::nullopt;
+
+    auto txids = prov.GetBlockTxids(shard_id, disputed_height);
+    if (txids.empty()) return std::nullopt;
+
+    FraudProof fp;
+    fp.shard_id = shard_id;
+    fp.disputed_height = disputed_height;
+    fp.tx_index = tx_index;
+
+    fp.headers_to_tip = hdrs;
+    fp.entry = tr.entry;
+    fp.trace_leaf_path = tr.path_to_trace_root;
+    fp.tx = tr.tx;
+    fp.fee_recipient_pkh = tr.fee_recipient_pkh;
+    fp.block_txids_in_order = txids;
+
+    return fp;
+}
+
+// ============================================================
+// Demo tx builders
+// ============================================================
+static Tx make_signed_p2wpkh_spend(const OutPoint& prev,
+                                  const Coin& prevcoin,
+                                  const KeyPair& spender,
+                                  const Hash20& recipient_pkh,
+                                  uint64_t fee_value,
+                                  uint64_t pay_value) {
+    Tx tx;
+    tx.version = 2;
+    tx.locktime = 0;
+    tx.vin.resize(1);
+    tx.vout.resize(2);
+
+    tx.vin[0].prevout = prev;
+    tx.vin[0].sequence = 0xFFFFFFFF;
+
+    tx.vout[0] = TxOut{fee_value, fee_sink_scriptpubkey()};
+    tx.vout[1] = TxOut{pay_value, p2wpkh_spk_from_h160(recipient_pkh)};
+
+    tx.txid = compute_txid(tx);
+
+    const Hash32 hp = hashPrevouts(tx);
+    const Hash32 hs = hashSequence(tx);
+    const Hash32 ho = hashOutputs(tx);
+
+    Hash32 digest = bip143_sighash_all_p2wpkh_prehashed(
+        tx, 0, prevcoin, spender.pkh, hp, hs, ho, 1
+    );
+
+    tx.vin[0].witness_pubkey = spender.pubkey33;
+    tx.vin[0].witness_sig = ecdsa_sign_der_sighashall_lowS(spender.key, digest);
+
+    return tx;
+}
+
+static Tx make_payout_tx(const std::vector<OutPoint>& fee_outpoints_sorted,
+                         const Hash20& fee_recipient_pkh,
+                         uint64_t total_collected) {
+    Tx tx;
+    tx.version = 2;
+    tx.locktime = 0;
+
+    tx.vin.resize(fee_outpoints_sorted.size());
+    for (size_t i=0;i<fee_outpoints_sorted.size();i++) {
+        tx.vin[i].prevout = fee_outpoints_sorted[i];
+        tx.vin[i].sequence = 0xFFFFFFFF;
+        tx.vin[i].witness_pubkey.clear();
+        tx.vin[i].witness_sig.clear();
+    }
+
+    tx.vout.resize(1);
+    tx.vout[0] = TxOut{total_collected, p2wpkh_spk_from_h160(fee_recipient_pkh)};
+    tx.txid = compute_txid(tx);
+    return tx;
+}
+
+// ============================================================
+// MAIN: mine good block, then mine corrupt block, then prove fraud remotely
+// ============================================================
+int main() {
+    try {
+        KeyPair alice = generate_keypair();
+        KeyPair bob   = generate_keypair();
+        KeyPair miner = generate_keypair();
+
+        std::optional<FeeSnapshot> snap = std::nullopt;
+
+        ShardChainForkedC shard0(0);
+
+        // Seed UTXO to alice
+        Hash32 seed_txid{}; seed_txid.fill(0x01);
+        OutPoint seed_op{seed_txid, 0};
+        Coin seed_coin{5000, p2wpkh_spk_from_h160(alice.pkh)};
+        shard0.seed_utxo(seed_op, seed_coin);
+
+        // Block1: valid spend alice->bob + payout
+        uint64_t pay1 = 4000;
+        Tx tmp; tmp.vout.resize(2);
+        tmp.vout[0] = TxOut{0, fee_sink_scriptpubkey()};
+        tmp.vout[1] = TxOut{pay1, p2wpkh_spk_from_h160(bob.pkh)};
+        uint64_t fee1 = compute_fee(tmp, snap);
+
+        Tx tx1 = make_signed_p2wpkh_spend(seed_op, seed_coin, alice, bob.pkh, fee1, pay1);
+        std::vector<OutPoint> fee_ops1 = { OutPoint{tx1.txid, 0} };
+        std::sort(fee_ops1.begin(), fee_ops1.end());
+        Tx payout1 = make_payout_tx(fee_ops1, miner.pkh, fee1);
+
+        Block b1;
+        b1.fee_recipient_pkh
